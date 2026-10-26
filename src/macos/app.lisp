@@ -35,10 +35,43 @@ target, a data source or a delegate.")
     ((self application-delegate) (notification objc:objc-object-pointer))
   (declare (ignorable self notification))
   (handler-case (when *controller*
-                  (stop-and-wait *controller*)
                   (save-settings *controller*)
+                  (close-window-controller *controller*)
                   (note "quit"))
     (error (condition) (note "applicationWillTerminate: ~a" condition))))
+
+;;; Opening images and folders: from Finder's Open With, the Dock, `open -a`.
+(objc:define-objc-method ("application:openURLs:" :void)
+    ((self application-delegate) (application objc:objc-object-pointer)
+     (urls objc:objc-object-pointer))
+  (declare (ignorable self application))
+  (handler-case
+      (when *controller*
+        (open-paths *controller*
+                    (loop for i below (objc:invoke urls "count")
+                          collect (objc:invoke-into 'string (objc:invoke urls "objectAtIndex:" i)
+                                                    "path")))
+        (show-window *controller*))
+    (error (condition) (note "application:openURLs: ~a" condition))))
+
+;;; The Finder service, "Describe with Image Describer", in a folder's or an
+;;; image's Quick Actions and Services menus.  Info.plist's NSServices names
+;;; the message; this object answers it.
+(objc:define-objc-class services-provider ()
+  ()
+  (:objc-class-name "ImageDescribeServicesProvider"))
+
+(defvar *services-provider* nil)
+
+(objc:define-objc-method ("describeFiles:userData:error:" :void)
+    ((self services-provider) (pasteboard objc:objc-object-pointer)
+     (user-data objc:objc-object-pointer) (error (:pointer :void)))
+  (declare (ignorable self user-data error))
+  (handler-case
+      (when *controller*
+        (open-paths *controller* (paths-from-pasteboard pasteboard))
+        (show-window *controller*))
+    (error (condition) (note "describeFiles: ~a" condition))))
 
 ;;; The menu ----------------------------------------------------------------------
 ;;;
@@ -95,6 +128,7 @@ case KEY is Shift-Command already."
                    :separator
                    ("Accept" "acceptSelected:" "s")
                    ("Accept All" "acceptAll:" "S")
+                   ("Revert to Saved" "revertDescription:" "u")
                    ("Remove Description" "removeDescription:")
                    :separator
                    ("Show in Finder" "showInFinder:" "r" 1572864)
@@ -127,6 +161,10 @@ case KEY is Shift-Command already."
     (install-menu)
     (objc:invoke (objc.runloop:shared-application) "setDelegate:"
                  (objc:objc-object-pointer delegate))
+    (setf *services-provider* (make-instance 'services-provider))
+    (objc:invoke (objc.runloop:shared-application) "setServicesProvider:"
+                 (objc:objc-object-pointer *services-provider*))
+    (ignore-errors (ccall "NSUpdateDynamicServices" :void))
     controller))
 
 (defun env (name)
@@ -152,7 +190,9 @@ The options remembered from the window are neither read nor changed."
         *accept-when-done* (equal (env "IMAGE_DESCRIBE_SELFTEST_ACCEPT") "1"))
   (objc:invoke (controller-folder-field controller) "setStringValue:" folder)
   (objc:invoke (controller-recursive-checkbox controller) "setState:" 1)
-  (rescan controller)
+  ;; Listed before identifying begins, not on a thread of its own.
+  (let ((*list-in-background* nil))
+    (rescan controller))
   (note "self test: ~a: ~a" folder (status-line controller))
   (unless (start-identifying controller)
     (note "self test: did not start: ~a" (status-line controller))
@@ -160,7 +200,15 @@ The options remembered from the window are neither read nor changed."
     (objc:invoke (objc.runloop:shared-application) "terminate:" nil)))
 
 (defun main ()
-  "The application's entry point.  Does not return."
+  "The application's entry point.  Does not return.  Given arguments, it is
+the command-line program instead (cli.lisp)."
+  (let ((arguments uiop:*command-line-arguments*))
+    (when (cli-arguments-p arguments)
+      (uiop:quit (handler-case (run-cli arguments)
+                   (error (condition)
+                     (ignore-errors (format (fd-stream 2) "~&image-describe: ~a~%"
+                                            (condition-text condition)))
+                     1)))))
   (setf *log* *error-output*)
   (handler-case
       (let ((self-test (self-test-folder))

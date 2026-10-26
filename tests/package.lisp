@@ -192,3 +192,56 @@ program.  A string, a list of strings, or :INVALID."
                                      (substitute #\Space #\Newline hex) :separator " ")
                                  :test #'string=))))
         (plutil-reading octets)))))
+
+;;; Photographs with what cameras record ------------------------------------------
+
+(defun write-cg (cg path type &optional properties)
+  "Write CG to PATH as TYPE (\"public.jpeg\"), with PROPERTIES, an NSDictionary."
+  (ensure-directories-exist (native-pathname path))
+  (let ((destination (id::ccall "CGImageDestinationCreateWithURL"
+                                :pointer (objc:invoke "NSURL" "fileURLWithPath:" path)
+                                :pointer (id::ns-string type) :size 1
+                                :pointer (cffi:null-pointer) :pointer)))
+    (id::ccall "CGImageDestinationAddImage" :pointer destination :pointer cg
+               :pointer (or properties (cffi:null-pointer)) :void)
+    (prog1 (id::ccall "CGImageDestinationFinalize" :pointer destination :bool)
+      (id::cf-release destination)))
+  path)
+
+(defun make-photo (path &key (from (account-picture "Zebra")) date latitude longitude orientation)
+  "A JPEG at PATH of FROM, recording DATE (\"2023:07:04 18:22:01\"), a GPS
+position and an EXIF ORIENTATION as a camera would."
+  (id:ensure-vision)
+  (let ((cg (id::image-io-thumbnail from 512)))
+    (unwind-protect
+         (write-cg cg path "public.jpeg"
+                   (apply #'id::dictionary
+                          (append (and date (list "{Exif}" (id::dictionary "DateTimeOriginal" date)))
+                                  (and latitude
+                                       (list "{GPS}" (id::dictionary
+                                                      "Latitude" (abs latitude)
+                                                      "LatitudeRef" (if (minusp latitude) "S" "N")
+                                                      "Longitude" (abs longitude)
+                                                      "LongitudeRef" (if (minusp longitude) "W" "E"))))
+                                  (and orientation (list "kCGImagePropertyOrientation" orientation)))))
+      (id::cf-release cg))))
+
+(defun make-qr-code (path message)
+  "A PNG at PATH of a QR code saying MESSAGE, drawn by CoreImage."
+  (id:ensure-vision)
+  (objc:with-autorelease-pool ()
+    (let ((filter (objc:invoke "CIFilter" "filterWithName:" "CIQRCodeGenerator")))
+      (objc:invoke filter "setValue:forKey:"
+                   (objc:invoke (id::ns-string message) "dataUsingEncoding:" 4)
+                   (id::ns-string "inputMessage"))
+      (let* ((ci (objc:invoke (objc:invoke filter "outputImage") "imageByApplyingTransform:"
+                              #(10d0 0d0 0d0 10d0 0d0 0d0)))
+             (cg (objc:invoke (objc:invoke "CIContext" "contextWithOptions:" nil)
+                              "createCGImage:fromRect:" ci (objc:invoke ci "extent"))))
+        (unwind-protect (write-cg cg path "public.png")
+          (id::cf-release cg))))))
+
+(defun live-p (name)
+  "Whether the environment variable NAME asks for a test that uses the
+network or another program to run."
+  (equal (uiop:getenv name) "1"))

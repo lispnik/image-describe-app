@@ -22,19 +22,25 @@
    (folder-field :initform nil :accessor controller-folder-field)
    (recursive-checkbox :initform nil :accessor controller-recursive-checkbox)
    (text-checkbox :initform nil :accessor controller-text-checkbox)
+   (places-checkbox :initform nil :accessor controller-places-checkbox)
+   (claude-checkbox :initform nil :accessor controller-claude-checkbox)
+   (tags-checkbox :initform nil :accessor controller-tags-checkbox)
+   (get-info-checkbox :initform nil :accessor controller-get-info-checkbox)
    (confidence-slider :initform nil :accessor controller-confidence-slider)
    (confidence-label :initform nil :accessor controller-confidence-label)
    (table :initform nil :accessor controller-table)
    (preview :initform nil :accessor controller-preview)
    (preview-path :initform nil :accessor controller-preview-path
-                 :documentation "The image the preview shows, so that selecting it
-again does not read it again.")
+                 :documentation "The image the preview shows, or is being made of.")
+   (previewer :initform nil :accessor controller-previewer
+              :documentation "The thread making previews (preview.lisp).")
    (title-label :initform nil :accessor controller-title-label)
    (editor :initform nil :accessor controller-editor)
    (editor-row :initform nil :accessor controller-editor-row
                :documentation "The row the description field is editing, or NIL.")
    (accept-button :initform nil :accessor controller-accept-button)
    (again-button :initform nil :accessor controller-again-button)
+   (revert-button :initform nil :accessor controller-revert-button)
    (status-label :initform nil :accessor controller-status-label)
    (identify-button :initform nil :accessor controller-identify-button)
    (accept-all-button :initform nil :accessor controller-accept-all-button)
@@ -50,7 +56,20 @@ images in hand are being finished.")
    (message :initform nil :accessor controller-message
             :documentation "Something to say in place of the count of images.")
    (confirmed-quit :initform nil :accessor controller-confirmed-quit
-                   :documentation "Losing the unaccepted descriptions was agreed to."))
+                   :documentation "Losing the unaccepted descriptions was agreed to.")
+   (listing :initform nil :accessor controller-listing
+            :documentation "The folder is being listed, by a thread of its own.")
+   (listing-generation :initform 0 :accessor controller-listing-generation
+                       :documentation "Counts listings, so that an old one's answer is not taken.")
+   (listing-result :initform nil :accessor controller-listing-result
+                   :documentation "(generation entries error), from the listing thread.")
+   (listing-lock :initform (sb-thread:make-mutex :name "listing") :accessor controller-listing-lock)
+   (select-after-listing :initform '() :accessor controller-select-after-listing
+                         :documentation "Paths to select once the folder is listed: dropped files.")
+   (undo-manager :initform nil :accessor controller-undo-manager)
+   (undo-actions :initform (make-hash-table) :accessor controller-undo-actions
+                 :documentation "What each registered undo does, by the number given NSUndoManager.")
+   (undo-count :initform 0 :accessor controller-undo-count))
   (:objc-class-name "ImageDescribeWindowController"))
 
 (defmacro define-controller-method ((selector result-type &key on-error)
@@ -103,6 +122,10 @@ tests bind it to NIL, so as not to change the settings of whoever runs them.")
       (objc:invoke defaults "setObject:forKey:" (folder-path controller) "Folder")
       (objc:invoke defaults "setBool:forKey:" (recursive-p controller) "IncludeSubfolders")
       (objc:invoke defaults "setBool:forKey:" (read-text-p controller) "ReadText")
+      (objc:invoke defaults "setBool:forKey:" (places-p controller) "PlaceNames")
+      (objc:invoke defaults "setBool:forKey:" (claude-p controller) "UseClaude")
+      (objc:invoke defaults "setBool:forKey:" (tags-p controller) "FinderTags")
+      (objc:invoke defaults "setBool:forKey:" (get-info-p controller) "GetInfoComments")
       (objc:invoke defaults "setInteger:forKey:" (confidence-percent controller)
                    "MinimumConfidence"))))
 
@@ -143,6 +166,21 @@ tests bind it to NIL, so as not to change the settings of whoever runs them.")
 
 (defun read-text-p (controller)
   (checked-p (controller-text-checkbox controller)))
+
+(defun places-p (controller)
+  (checked-p (controller-places-checkbox controller)))
+
+(defun claude-p (controller)
+  (checked-p (controller-claude-checkbox controller)))
+
+(defun tags-p (controller)
+  (checked-p (controller-tags-checkbox controller)))
+
+(defun get-info-p (controller)
+  (checked-p (controller-get-info-checkbox controller)))
+
+(defun set-checked (checkbox on)
+  (objc:invoke checkbox "setState:" (if on 1 0)))
 
 (defun confidence-percent (controller)
   (objc:invoke (controller-confidence-slider controller) "integerValue"))
@@ -213,6 +251,8 @@ tests bind it to NIL, so as not to change the settings of whoever runs them.")
          (nothing (count-state controller :nothing))
          (waiting (count-state controller nil :identifying)))
     (cond ((controller-message controller))
+          ((controller-listing controller)
+           "Listing the images…")
           ((controller-stopping controller)
            "Stopping: finishing the images in hand…")
           ((controller-running controller)
@@ -269,20 +309,68 @@ titles, and which can be used."
                       t))
     (objc:invoke (controller-again-button controller) "setEnabled:"
                  (and (not running) selected t))
+    (objc:invoke (controller-revert-button controller) "setEnabled:"
+                 (let ((entry (and (= 1 (length selected)) (entry-at controller (first selected)))))
+                   (and entry (member (entry-state entry) '(:edited :proposed)) t)))
     (dolist (control (controller-option-controls controller))
       (objc:invoke control "setEnabled:" (not running)))))
 
 ;;; The folder ------------------------------------------------------------------------
 
-(defun rescan (controller)
-  "List the images in the folder again.  An image listed before keeps what
+(defvar *list-in-background* t
+  "Whether the folder is listed on a thread of its own.  The tests list it
+on theirs, so that the table is filled when they look.")
+
+(defun rescan (controller &key select)
+  "List the images in the folder again, on a thread of its own, and then
+select those of SELECT, a list of paths.  An image listed before keeps what
 was found in it and any description being reviewed; the others are read from
 their files."
-  (let* ((folder (folder-path controller))
-         (old (make-hash-table :test #'equal))
-         (found (if (directory-exists-p folder)
-                    (entries-from-directory folder :recursive (recursive-p controller))
-                    #())))
+  (let ((folder (folder-path controller))
+        (recursive (recursive-p controller))
+        (generation (incf (controller-listing-generation controller)))
+        (target (objc:objc-object-pointer controller)))
+    (setf (controller-select-after-listing controller) select
+          (controller-message controller) nil)
+    (cond ((not (directory-exists-p folder))
+           (setf (controller-listing controller) nil)
+           (apply-listing controller #()))
+          ((not *list-in-background*)
+           (apply-listing controller (entries-from-directory folder :recursive recursive)))
+          (t
+           (setf (controller-listing controller) t)
+           (refresh-controls controller)
+           (start-listing folder :recursive recursive
+                                 :on-done (lambda (entries error)
+                                            (sb-thread:with-mutex ((controller-listing-lock controller))
+                                              (setf (controller-listing-result controller)
+                                                    (list generation entries error)))
+                                            (objc:invoke target "performSelectorOnMainThread:withObject:waitUntilDone:"
+                                                         (objc:coerce-to-selector "listingDone:")
+                                                         nil nil)))))
+    controller))
+
+(defun take-listing (controller)
+  "The entries the listing thread found, and its error, if it has finished
+the latest listing."
+  (let ((result (sb-thread:with-mutex ((controller-listing-lock controller))
+                  (shiftf (controller-listing-result controller) nil))))
+    (when (and result (= (first result) (controller-listing-generation controller)))
+      (values (or (second result) #()) (third result) t))))
+
+(define-controller-method ("listingDone:" :void) ((argument objc:objc-object-pointer))
+  (multiple-value-bind (entries error found) (take-listing self)
+    (when found
+      (setf (controller-listing self) nil)
+      (apply-listing self entries)
+      (when error
+        (setf (controller-message self) (format nil "The folder could not be listed: ~a" error))
+        (refresh-controls self)))))
+
+(defun apply-listing (controller found)
+  "Make FOUND, entries just listed, the table's rows, keeping what is known
+of each image listed before."
+  (let ((old (make-hash-table :test #'equal)))
     (loop for entry across (controller-entries controller)
           do (setf (gethash (entry-path entry) old) entry))
     (setf (controller-entries controller)
@@ -297,10 +385,21 @@ their files."
                                              (not (eq :identified (entry-status before))))
                                     (setf (entry-description before) (entry-saved entry)))
                                   before))))
-               found)
-          (controller-message controller) nil)
-    (objc:invoke (controller-table controller) "reloadData")
-    (objc:invoke (controller-table controller) "deselectAll:" nil)
+               found))
+    (let ((table (controller-table controller))
+          (select (controller-select-after-listing controller)))
+      (objc:invoke table "reloadData")
+      (objc:invoke table "deselectAll:" nil)
+      (when select
+        (let ((set (objc:invoke "NSMutableIndexSet" "indexSet")))
+          (loop for entry across (controller-entries controller)
+                for row from 0
+                when (member (entry-path entry) select :test #'string=)
+                  do (objc:invoke set "addIndex:" row))
+          (objc:invoke table "selectRowIndexes:byExtendingSelection:" set nil)
+          (when (plusp (objc:invoke set "count"))
+            (objc:invoke table "scrollRowToVisible:" (objc:invoke set "firstIndex")))))
+      (setf (controller-select-after-listing controller) '()))
     (show-selection controller)
     (refresh-controls controller)
     controller))
@@ -346,7 +445,25 @@ their files."
 
 (defun propose (controller entry)
   (propose-description entry :minimum-confidence (minimum-confidence controller)
-                             :include-text (read-text-p controller)))
+                             :include-text (read-text-p controller)
+                             :include-place (places-p controller)))
+
+(defun look-up-places (controller entries)
+  "Find the place names of ENTRIES that have a position and no place yet;
+each, when it comes, goes into the proposal."
+  (dolist (entry entries)
+    (let* ((analysis (entry-analysis entry))
+           (location (and analysis (analysis-location analysis))))
+      (when (and location (null (analysis-place analysis)))
+        (lookup-place (car location) (cdr location)
+                      (lambda (name)
+                        (when name
+                          (setf (analysis-place analysis) name)
+                          (when (member (entry-state entry) '(:proposed :nothing))
+                            (propose controller entry))
+                          (objc:invoke (controller-table controller) "reloadData")
+                          (when (eq entry (entry-at controller (controller-editor-row controller)))
+                            (show-selection controller)))))))))
 
 (defun show-confidence (controller)
   (objc:invoke (controller-confidence-label controller) "setStringValue:"
@@ -354,6 +471,8 @@ their files."
 
 (defun settings-changed (controller)
   (show-confidence controller)
+  (when (places-p controller)
+    (look-up-places controller (coerce (controller-entries controller) 'list)))
   (loop for entry across (controller-entries controller)
         when (member (entry-state entry) '(:proposed :nothing))
           do (propose controller entry))
@@ -385,7 +504,8 @@ their files."
 (defun start-identifying (controller &optional rows)
   "Identify ROWS, or every row not identified yet.  True if it began."
   (let ((rows (or rows (pending-rows controller)))
-        (read-text (read-text-p controller)))
+        (read-text (read-text-p controller))
+        (caption (and (claude-p controller) #'claude-caption)))
     (setf (controller-message controller)
           (cond ((not (directory-exists-p (folder-path controller)))
                  "Choose a folder that exists.")
@@ -406,7 +526,8 @@ their files."
                  (min (length rows) (or *worker-count* (default-worker-count))))
            (setf (controller-run controller)
                  (start-batch (controller-entries controller)
-                              (lambda (entry) (identification entry :read-text read-text))
+                              (lambda (entry)
+                                (identification entry :read-text read-text :caption caption))
                               :begin #'begin-identifying
                               :indices rows)
                  (controller-stopping controller) nil)
@@ -473,6 +594,8 @@ look, and end the run when they all have.  Answers true while it goes on."
                               (progn (abandon-identifying controller) t))))
                (finished (take-finished run))
                (entries (controller-entries controller)))
+          (when (places-p controller)
+            (look-up-places controller (mapcar (lambda (index) (aref entries index)) finished)))
           (dolist (index finished)
             (let ((entry (aref entries index)))
               (propose controller entry)
@@ -525,23 +648,75 @@ inside IM or Vision leaves nothing half written."
 
 ;;; Accepting ---------------------------------------------------------------------
 
-(defun accept-rows (controller rows)
-  "Write the descriptions of ROWS onto their files.  Answers how many were."
-  (let ((written 0) (failed 0))
-    (dolist (row rows)
-      (let ((entry (entry-at controller row)))
-        (when (and entry (member (entry-state entry) '(:proposed :edited :saved)))
-          (if (accept-entry entry)
-              (progn (incf written)
-                     (note "saved: ~a: ~a" (entry-path entry) (entry-saved entry)))
-              (progn (incf failed)
-                     (note "not saved: ~a: ~a" (entry-path entry) (entry-message entry)))))))
-    (setf (controller-message controller)
-          (and (plusp failed)
-               (format nil "~d description~:p could not be written — the file~:p may be locked or read-only."
-                       failed)))
+;;; Undo ----------------------------------------------------------------------------
+;;;
+;;; Accept and Remove Description change files, so Edit > Undo puts them back:
+;;; each takes a snapshot of the rows it changes, and undoing restores the
+;;; snapshots and writes what the files carried before, taking a snapshot of
+;;; its own for Redo.  NSUndoManager keeps a number; what it means is here.
+
+(defun snapshot (entry)
+  (list entry (entry-saved entry) (entry-description entry) (entry-edited entry)
+        (entry-status entry) (entry-analysis entry) (entry-message entry)))
+
+(defun restore-snapshots (controller snapshots)
+  "Put each row of SNAPSHOTS back as it was, and its file."
+  (let ((changed '()))
+    (dolist (snapshot snapshots)
+      (destructuring-bind (entry saved description edited status analysis message) snapshot
+        (let ((file-changed (not (equal saved (entry-saved entry)))))
+          (setf (entry-saved entry) saved (entry-description entry) description
+                (entry-edited entry) edited (entry-status entry) status
+                (entry-analysis entry) analysis (entry-message entry) message)
+          (when file-changed
+            (handler-case
+                (progn (write-description (entry-path entry) (or saved "")
+                                          :tags (tags-for controller saved))
+                       (push entry changed))
+              (error (condition)
+                (setf (entry-message entry) (condition-text condition)
+                      (entry-status entry) :error)))))))
+    (tell-finder controller (nreverse changed))
     (objc:invoke (controller-table controller) "reloadData")
-    written))
+    (show-selection controller)
+    (refresh-controls controller)))
+
+(defun register-undo (controller name function)
+  (let ((manager (controller-undo-manager controller))
+        (id (incf (controller-undo-count controller))))
+    (when manager
+      (setf (gethash id (controller-undo-actions controller)) function)
+      (objc:invoke manager "registerUndoWithTarget:selector:object:"
+                   (objc:objc-object-pointer controller)
+                   (objc:coerce-to-selector "performUndo:")
+                   (objc:invoke "NSNumber" "numberWithLong:" id))
+      (objc:invoke manager "setActionName:" name))))
+
+(defun undoable (controller name snapshots)
+  "Register, as NAME, putting SNAPSHOTS back; doing so registers the redo."
+  (register-undo controller name
+                 (lambda ()
+                   (let ((now (mapcar (lambda (snapshot) (snapshot (first snapshot))) snapshots)))
+                     (restore-snapshots controller snapshots)
+                     (undoable controller name now)))))
+
+(defmacro with-undo ((controller name entries) &body body)
+  "Run BODY, which changes ENTRIES, as one undoable action called NAME."
+  (let ((snapshots (gensym)))
+    `(let ((,snapshots (mapcar #'snapshot (remove nil ,entries))))
+       (multiple-value-prog1 (progn ,@body)
+         (undoable ,controller ,name ,snapshots)))))
+
+(define-controller-method ("performUndo:" :void) ((number objc:objc-object-pointer))
+  (let* ((id (objc:invoke number "longValue"))
+         (function (gethash id (controller-undo-actions self))))
+    (remhash id (controller-undo-actions self))
+    (when function (funcall function))))
+
+(define-controller-method ("windowWillReturnUndoManager:" objc:objc-object-pointer
+                           :on-error (cffi:null-pointer))
+    ((window objc:objc-object-pointer))
+  (or (controller-undo-manager self) (cffi:null-pointer)))
 
 (defun commit-editing (controller)
   "End any typing in the window, so that what was typed is in its entry."
@@ -566,25 +741,84 @@ next one to review, so that a folder can be gone through with Return alone."
   (show-selection self)
   (refresh-controls self))
 
+(defun tags-for (controller description)
+  "The Finder tags to write with DESCRIPTION: its first keyword, if tags
+are chosen; else leave the tags as they are."
+  (if (tags-p controller)
+      (let ((first (first (description-keywords (or description "")))))
+        (and first (list first)))
+      :keep))
+
+(defun tell-finder (controller entries)
+  "With Get Info comments chosen, have Finder set ENTRIES' comments to what
+they carry.  If Finder may not be told, say why and stop asking."
+  (when (and entries (get-info-p controller))
+    (handler-case
+        (set-finder-comments (mapcar (lambda (entry) (cons (entry-path entry) (entry-saved entry)))
+                                     entries))
+      (error (condition)
+        (note "Get Info: ~a" condition)
+        (set-checked (controller-get-info-checkbox controller) nil)
+        (save-settings controller)
+        (setf (controller-message controller)
+              (format nil "~a. Show descriptions in Get Info is off." (condition-text condition)))))))
+
+(defun accept-rows (controller rows)
+  "Write the descriptions of ROWS onto their files.  Answers how many were.
+Undoable."
+  (let ((written '()) (failed 0))
+    (with-undo (controller "Accept" (mapcar (lambda (row) (entry-at controller row)) rows))
+      (dolist (row rows)
+        (let ((entry (entry-at controller row)))
+          (when (and entry (member (entry-state entry) '(:proposed :edited :saved)))
+            (if (accept-entry entry :tags (tags-for controller (entry-description entry)))
+                (progn (push entry written)
+                       (note "saved: ~a: ~a" (entry-path entry) (entry-saved entry)))
+                (progn (incf failed)
+                       (note "not saved: ~a: ~a" (entry-path entry) (entry-message entry))))))))
+    (setf (controller-message controller)
+          (and (plusp failed)
+               (format nil "~d description~:p could not be written — the file~:p may be locked or read-only."
+                       failed)))
+    (tell-finder controller (reverse written))
+    (objc:invoke (controller-table controller) "reloadData")
+    (length written)))
+
 (define-controller-method ("removeDescription:" :void) ((sender objc:objc-object-pointer))
-  (let ((failed 0))
-    (dolist (row (selected-rows self))
-      (let ((entry (entry-at self row)))
-        (unless (eq (entry-state entry) :identifying)
-          (handler-case
-              (progn (remove-description (entry-path entry))
-                     (setf (entry-saved entry) nil (entry-description entry) nil
-                           (entry-edited entry) nil (entry-analysis entry) nil
-                           (entry-status entry) nil (entry-message entry) nil)
-                     (note "removed: ~a" (entry-path entry)))
-            (error (condition)
-              (incf failed)
-              (setf (entry-message entry) (condition-text condition)))))))
+  (let ((failed 0) (removed '())
+        (entries (remove-if (lambda (entry) (or (null entry) (eq (entry-state entry) :identifying)))
+                            (mapcar (lambda (row) (entry-at self row)) (selected-rows self)))))
+    (with-undo (self "Remove Description" entries)
+      (dolist (entry entries)
+        (handler-case
+            (progn (remove-description (entry-path entry) :tags (if (tags-p self) '() :keep))
+                   (setf (entry-saved entry) nil (entry-description entry) nil
+                         (entry-edited entry) nil (entry-analysis entry) nil
+                         (entry-status entry) nil (entry-message entry) nil)
+                   (push entry removed)
+                   (note "removed: ~a" (entry-path entry)))
+          (error (condition)
+            (incf failed)
+            (setf (entry-message entry) (condition-text condition))))))
     (setf (controller-message self)
           (and (plusp failed) (format nil "~d description~:p could not be removed." failed)))
+    (tell-finder self (nreverse removed))
     (objc:invoke (controller-table self) "reloadData")
     (show-selection self)
     (refresh-controls self)))
+
+(define-controller-method ("revertDescription:" :void) ((sender objc:objc-object-pointer))
+  (let ((entry (entry-at self (controller-editor-row self))))
+    (when (and entry (not (eq (entry-state entry) :identifying)))
+      (commit-editing self)
+      (setf (entry-edited entry) nil
+            (entry-description entry) (entry-saved entry))
+      ;; With nothing written, back to what Vision proposed.
+      (unless (entry-saved entry)
+        (propose self entry))
+      (objc:invoke (controller-table self) "reloadData")
+      (show-selection self)
+      (refresh-controls self))))
 
 (define-controller-method ("showInFinder:" :void) ((sender objc:objc-object-pointer))
   (let* ((clicked (objc:invoke (controller-table self) "clickedRow"))
@@ -603,33 +837,24 @@ next one to review, so that a folder can be gone through with Return alone."
   "Whether the description field is being typed in."
   (not (null-object-p (objc:invoke (controller-editor controller) "currentEditor"))))
 
-(defun nsimage-of (path)
-  "A new NSImage of the image at PATH, which the caller releases, or NIL.
-AppKit's reading first, which knows the orientation a camera recorded; IM's
-for the formats AppKit does not read."
-  (let ((image (objc:invoke (objc:invoke "NSImage" "alloc") "initWithContentsOfFile:" path)))
-    (cond ((and (not (null-object-p image)) (objc:invoke-bool image "isValid"))
-           image)
-          (t
-           (unless (null-object-p image) (objc:release image))
-           (ignore-errors
-            (let ((rgb (load-for-vision path :largest 1024)))
-              (let ((cg (unwind-protect (cg-image-from-rgb rgb) (im:destroy rgb))))
-                (unwind-protect
-                     (objc:invoke (objc:invoke "NSImage" "alloc") "initWithCGImage:size:"
-                                  cg #(0d0 0d0))
-                  (cf-release cg)))))))))
-
 (defun show-preview (controller entry)
+  "Show ENTRY's picture: at once if it was made before, else once the
+preview thread has made it (previewReady:)."
   (let ((path (and entry (entry-path entry)))
         (view (controller-preview controller)))
     (unless (equal path (controller-preview-path controller))
       (setf (controller-preview-path controller) path)
-      (if (null path)
+      (if (or (null path) (null (controller-previewer controller)))
           (objc:invoke view "setImage:" nil)
-          (let ((image (nsimage-of path)))
-            (objc:invoke view "setImage:" image)
-            (when image (objc:release image)))))))
+          (multiple-value-bind (image found) (request-preview (controller-previewer controller) path)
+            (objc:invoke view "setImage:" (and found image)))))))
+
+(define-controller-method ("previewReady:" :void) ((argument objc:objc-object-pointer))
+  (let ((path (controller-preview-path self)))
+    (when (and path (controller-previewer self))
+      (multiple-value-bind (image found) (cached-preview (controller-previewer self) path)
+        (when found
+          (objc:invoke (controller-preview self) "setImage:" image))))))
 
 (defun placeholder-for (entry)
   (ecase (entry-state entry)
@@ -946,15 +1171,15 @@ follow the knob."
     (objc:release scroll)
     table))
 
-(defparameter +window-width+ 860d0)
-(defparameter +window-height+ 700d0)
-(defparameter +options-height+ 92d0)
+(defparameter +window-width+ 880d0)
+(defparameter +window-height+ 760d0)
+(defparameter +options-height+ 152d0)
 (defparameter +detail-height+ 190d0)
 (defparameter +bottom-bar+ 56d0)
 
 (defun add-options (controller content target)
-  "The options, in a box across the top of the window: the folder, whether to
-look in its subfolders, whether to read text, and how sure Vision must be."
+  "The options, in a box across the top of the window: the folder, what to
+find in each image, and what to write besides the comment and keywords."
   (let ((box (objc:invoke (objc:invoke "NSBox" "alloc") "initWithFrame:"
                           (vector 14d0 (- +window-height+ +options-height+ 10d0)
                                   (- +window-width+ 28d0) +options-height+))))
@@ -969,30 +1194,45 @@ look in its subfolders, whether to read text, and how sure Vision must be."
            (wide (logior +flexible-width+ +flexible-bottom+))
            (right (logior +flexible-left+ +flexible-bottom+))
            (left +flexible-bottom+)
-           (field-x 100d0)
+           (x 100d0)
            (y1 (- height 32d0))
-           (y2 (- height 62d0)))
-      (add-label inner "Folder:" (vector 8d0 (+ y1 3d0) 88d0 17d0) left :alignment 2)
-      (setf (controller-folder-field controller)
-            (add-path-field inner (vector field-x y1 (- width field-x 112d0) 22d0) wide target
-                            "The folder of images to describe"))
-      (let ((choose (add-button inner "Choose…" "chooseFolder:"
-                                (vector (- width 106d0) (- y1 6d0) 100d0 32d0) right target)))
-        (setf (controller-recursive-checkbox controller)
-              (add-checkbox inner "Include subfolders" (vector field-x (+ y2 2d0) 150d0 18d0)
-                            left target "optionsChanged:"))
-        (setf (controller-option-controls controller)
-              (list (controller-folder-field controller) choose
-                    (controller-recursive-checkbox controller))))
-      (setf (controller-text-checkbox controller)
-            (add-checkbox inner "Read text in images" (vector 262d0 (+ y2 2d0) 170d0 18d0)
-                          left target "settingsChanged:"))
-      (add-label inner "Minimum confidence:" (vector (- width 400d0) (+ y2 3d0) 136d0 17d0)
-                 right :alignment 2)
-      (setf (controller-confidence-slider controller)
-            (add-slider inner (vector (- width 258d0) y2 200d0 22d0) right target)
-            (controller-confidence-label controller)
-            (add-label inner "" (vector (- width 52d0) (+ y2 3d0) 44d0 17d0) right)))))
+           (y2 (- height 62d0))
+           (y3 (- height 90d0))
+           (y4 (- height 118d0)))
+      (flet ((checkbox (title x y w action)
+               (add-checkbox inner title (vector x (+ y 2d0) w 18d0) left target action)))
+        (add-label inner "Folder:" (vector 8d0 (+ y1 3d0) 88d0 17d0) left :alignment 2)
+        (setf (controller-folder-field controller)
+              (add-path-field inner (vector x y1 (- width x 112d0) 22d0) wide target
+                              "The folder of images to describe — or drop images or folders on the list"))
+        (let ((choose (add-button inner "Choose…" "chooseFolder:"
+                                  (vector (- width 106d0) (- y1 6d0) 100d0 32d0) right target)))
+          (setf (controller-recursive-checkbox controller)
+                (checkbox "Include subfolders" x y2 150d0 "optionsChanged:"))
+          (setf (controller-option-controls controller)
+                (list (controller-folder-field controller) choose
+                      (controller-recursive-checkbox controller))))
+        (add-label inner "Find:" (vector 8d0 (+ y2 3d0) 88d0 17d0) left :alignment 2)
+        (setf (controller-text-checkbox controller)
+              (checkbox "Text in images" 262d0 y2 130d0 "settingsChanged:"))
+        (add-label inner "Minimum confidence:" (vector (- width 400d0) (+ y2 3d0) 136d0 17d0)
+                   right :alignment 2)
+        (setf (controller-confidence-slider controller)
+              (add-slider inner (vector (- width 258d0) y2 200d0 22d0) right target)
+              (controller-confidence-label controller)
+              (add-label inner "" (vector (- width 52d0) (+ y2 3d0) 44d0 17d0) right))
+        (setf (controller-places-checkbox controller)
+              (checkbox "Place names (asks Apple)" x y3 200d0 "settingsChanged:")
+              (controller-claude-checkbox controller)
+              (checkbox "A sentence from Claude (sends each image to Anthropic)" 310d0 y3 380d0
+                        "claudeChanged:"))
+        (add-button inner "Key…" "setAPIKey:" (vector (- width 106d0) (- y3 6d0) 100d0 32d0)
+                    right target)
+        (add-label inner "Also:" (vector 8d0 (+ y4 3d0) 88d0 17d0) left :alignment 2)
+        (setf (controller-tags-checkbox controller)
+              (checkbox "Tag each in Finder with its first keyword" x y4 290d0 "settingsChanged:")
+              (controller-get-info-checkbox controller)
+              (checkbox "Show in Get Info (asks Finder)" 400d0 y4 260d0 "settingsChanged:"))))))
 
 (defun add-detail (controller content target)
   "Below the list: the selected image, and its description to edit."
@@ -1000,7 +1240,8 @@ look in its subfolders, whether to read text, and how sure Vision must be."
          (top (+ bottom +detail-height+))
          (fixed +flexible-top+)
          (x 224d0)
-         (width (- +window-width+ x 20d0)))
+         (width (- +window-width+ x 20d0))
+         (corner (logior +flexible-left+ +flexible-top+)))
     (setf (controller-preview controller)
           (add-preview content (vector 20d0 bottom 190d0 +detail-height+) fixed)
           (controller-title-label controller)
@@ -1009,34 +1250,41 @@ look in its subfolders, whether to read text, and how sure Vision must be."
           (controller-editor controller)
           (add-editor content (vector x (+ bottom 40d0) width (- +detail-height+ 66d0))
                       (logior +flexible-width+ +flexible-top+) target))
-    (add-label content "Return accepts and goes on to the next image to review."
-               (vector x (+ bottom 10d0) (- width 270d0) 17d0)
+    (add-label content "Return accepts and goes on to the next."
+               (vector x (+ bottom 10d0) (- width 360d0) 17d0)
                (logior +flexible-width+ +flexible-top+))
-    (setf (controller-again-button controller)
-          (add-button content "Identify Again" "identifyAgain:"
-                      (vector (- +window-width+ 20d0 100d0 136d0) (+ bottom 2d0) 130d0 32d0)
-                      (logior +flexible-left+ +flexible-top+) target)
-          (controller-accept-button controller)
-          (add-button content "Accept" "acceptSelected:"
-                      (vector (- +window-width+ 20d0 104d0) (+ bottom 2d0) 104d0 32d0)
-                      (logior +flexible-left+ +flexible-top+) target))))
+    (let ((right (- +window-width+ 20d0)))
+      (setf (controller-revert-button controller)
+            (add-button content "Revert" "revertDescription:"
+                        (vector (- right 104d0 136d0 96d0) (+ bottom 2d0) 90d0 32d0) corner target)
+            (controller-again-button controller)
+            (add-button content "Identify Again" "identifyAgain:"
+                        (vector (- right 104d0 136d0) (+ bottom 2d0) 130d0 32d0) corner target)
+            (controller-accept-button controller)
+            (add-button content "Accept" "acceptSelected:"
+                        (vector (- right 104d0) (+ bottom 2d0) 104d0 32d0) corner target)))))
 
 (defun restore-settings (controller)
   "Put the remembered options into the controls."
   (let ((folder (default-string "Folder")))
     (when folder
       (objc:invoke (controller-folder-field controller) "setStringValue:" (abbreviate-path folder)))
-    (objc:invoke (controller-recursive-checkbox controller) "setState:"
-                 (if (default-bool "IncludeSubfolders" nil) 1 0))
-    (objc:invoke (controller-text-checkbox controller) "setState:"
-                 (if (default-bool "ReadText" t) 1 0))
+    (set-checked (controller-recursive-checkbox controller) (default-bool "IncludeSubfolders" nil))
+    (set-checked (controller-text-checkbox controller) (default-bool "ReadText" t))
+    (set-checked (controller-places-checkbox controller) (default-bool "PlaceNames" nil))
+    ;; Not on without a key to send.
+    (set-checked (controller-claude-checkbox controller)
+                 (and (default-bool "UseClaude" nil) (api-key) t))
+    (set-checked (controller-tags-checkbox controller) (default-bool "FinderTags" nil))
+    (set-checked (controller-get-info-checkbox controller) (default-bool "GetInfoComments" nil))
     (objc:invoke (controller-confidence-slider controller) "setIntegerValue:"
                  (max 5 (min 95 (default-integer "MinimumConfidence"
                                                  (round (* 100 *default-minimum-confidence*))))))
     (show-confidence controller)))
 
-(defun make-window-controller ()
-  "A controller with its window built and not yet shown."
+(defun make-window-controller (&key (previews t))
+  "A controller with its window built and not yet shown.  With PREVIEWS, a
+thread to make the selected image's picture."
   (let* ((controller (make-instance 'window-controller))
          (target (objc:objc-object-pointer controller))
          (window (objc:invoke (objc:invoke "NSWindow" "alloc")
@@ -1047,10 +1295,17 @@ look in its subfolders, whether to read text, and how sure Vision must be."
     ;; Or the close button frees a window this still points at.
     (objc:invoke window "setReleasedWhenClosed:" nil)
     (objc:invoke window "setTitle:" "Image Describer")
-    (objc:invoke window "setContentMinSize:" #(720d0 560d0))
+    (objc:invoke window "setContentMinSize:" #(760d0 620d0))
     ;; So that menu items with no target -- File > Identify -- reach it.
     (objc:invoke window "setDelegate:" target)
-    (setf (controller-window controller) window)
+    (setf (controller-window controller) window
+          (controller-undo-manager controller) (objc:alloc-init-object "NSUndoManager"))
+    (when previews
+      (setf (controller-previewer controller)
+            (make-previewer (lambda (path)
+                              (declare (ignore path))
+                              (objc:invoke target "performSelectorOnMainThread:withObject:waitUntilDone:"
+                                           (objc:coerce-to-selector "previewReady:") nil nil)))))
     (add-options controller content target)
     ;; From the bottom up: the status line and the buttons, the selected
     ;; image, then the list.
@@ -1071,10 +1326,143 @@ look in its subfolders, whether to read text, and how sure Vision must be."
       (setf (controller-table controller)
             (add-table content (vector 20d0 bottom (- +window-width+ 40d0) (- top bottom))
                        (logior +flexible-width+ +flexible-height+) target)))
+    ;; Images and folders dropped on the list.
+    (objc:invoke (controller-table controller) "registerForDraggedTypes:"
+                 (objc:invoke "NSArray" "arrayWithObject:" (ns-string "public.file-url")))
     (restore-settings controller)
     (objc:invoke window "center")
     (rescan controller)
     controller))
+
+(defun close-window-controller (controller)
+  "Stop what CONTROLLER runs and close its window."
+  (stop-and-wait controller)
+  (setf (controller-run controller) nil)
+  (when (controller-previewer controller)
+    (stop-previewer (controller-previewer controller))
+    (setf (controller-previewer controller) nil))
+  (objc:invoke (controller-window controller) "close"))
+
+;;; Dropping images and folders ------------------------------------------------------
+
+(defun paths-from-pasteboard (pasteboard)
+  "The paths of the files on PASTEBOARD."
+  (let ((urls (objc:invoke pasteboard "readObjectsForClasses:options:"
+                           (objc:invoke "NSArray" "arrayWithObject:" (objc:invoke "NSURL" "class"))
+                           (dictionary "NSPasteboardURLReadingFileURLsOnlyKey" t))))
+    (if (null-object-p urls)
+        '()
+        (loop for i below (objc:invoke urls "count")
+              collect (objc:invoke-into 'string (objc:invoke urls "objectAtIndex:" i) "path")))))
+
+(defun common-folder (paths)
+  "The deepest folder holding every one of PATHS."
+  (let ((parts (mapcar (lambda (path) (butlast (uiop:split-string path :separator "/"))) paths)))
+    (let ((common (first parts)))
+      (dolist (other (rest parts))
+        (setf common (loop for a in common for b in other while (string= a b) collect a)))
+      (let ((joined (format nil "~{~a~^/~}" common)))
+        (if (zerop (length joined)) "/" joined)))))
+
+(defun open-paths (controller paths)
+  "Show PATHS: a folder is chosen as the folder; images are shown in theirs,
+with subfolders if they are in several, and selected."
+  (let* ((paths (mapcar (lambda (path) (string-right-trim "/" path)) paths))
+         (folder (find-if #'directory-exists-p paths))
+         (images (remove-if-not (lambda (path) (and (not (directory-exists-p path)) (image-file-p path)))
+                                paths)))
+    (cond ((controller-running controller)
+           (setf (controller-message controller) "Stop identifying first.")
+           (refresh-controls controller)
+           nil)
+          (folder
+           (set-folder controller folder)
+           t)
+          (images
+           (let* ((canonical (mapcar (lambda (path)
+                                       (native (truename (sb-ext:parse-native-namestring path))))
+                                     images))
+                  (common (common-folder canonical))
+                  (several (some (lambda (path)
+                                   (string/= common (subseq path 0 (position #\/ path :from-end t))))
+                                 canonical)))
+             (objc:invoke (controller-folder-field controller) "setStringValue:"
+                          (abbreviate-path common))
+             (when several
+               (set-checked (controller-recursive-checkbox controller) t))
+             (rescan controller :select canonical)
+             (save-settings controller)
+             t))
+          (t
+           (setf (controller-message controller) "Nothing dropped is an image or a folder.")
+           (refresh-controls controller)
+           nil))))
+
+(define-controller-method ("tableView:validateDrop:proposedRow:proposedDropOperation:"
+                           (:unsigned :long) :on-error 0)
+    ((table objc:objc-object-pointer)
+     (info objc:objc-object-pointer)
+     (row :long)
+     (operation (:unsigned :long)))
+  (cond ((controller-running self) 0)
+        (t
+         ;; Onto the whole list, not between two rows.
+         (objc:invoke table "setDropRow:dropOperation:" -1 0)
+         1)))                           ; NSDragOperationCopy
+
+(define-controller-method ("tableView:acceptDrop:row:dropOperation:" objc:objc-bool :on-error nil)
+    ((table objc:objc-object-pointer)
+     (info objc:objc-object-pointer)
+     (row :long)
+     (operation (:unsigned :long)))
+  (open-paths self (paths-from-pasteboard (objc:invoke info "draggingPasteboard"))))
+
+;;; Claude ----------------------------------------------------------------------------
+
+(defun ask-for-api-key ()
+  "Ask for an Anthropic API key and keep it in the Keychain.  Answers
+whether there is one afterwards."
+  (let ((alert (objc:invoke (objc:invoke "NSAlert" "alloc") "init"))
+        (field (objc:invoke (objc:invoke "NSSecureTextField" "alloc") "initWithFrame:"
+                            #(0d0 0d0 320d0 24d0))))
+    (unwind-protect
+         (progn
+           (objc:invoke alert "setMessageText:" "An Anthropic API key")
+           (objc:invoke alert "setInformativeText:"
+                        (format nil "With “A sentence from Claude”, each image is sent, as a ~
+JPEG 1024 pixels across, to Anthropic's API and ~a describes it in a sentence. ~
+That costs about a cent an image, charged to the key's account.~%~%The key is ~
+kept in your login Keychain.~@[ ANTHROPIC_API_KEY is set, and is used instead.~]"
+                                *claude-model*
+                                (let ((env (uiop:getenv "ANTHROPIC_API_KEY")))
+                                  (and env (plusp (length env))))))
+           (objc:invoke field "setPlaceholderString:" "sk-ant-…")
+           (objc:invoke alert "setAccessoryView:" field)
+           (objc:invoke alert "addButtonWithTitle:" "Keep")
+           (objc:invoke alert "addButtonWithTitle:" "Cancel")
+           (objc:invoke alert "addButtonWithTitle:" "Forget the Key")
+           (objc:invoke (objc:invoke alert "window") "setInitialFirstResponder:" field)
+           (case (- (objc:invoke alert "runModal") +ns-alert-first-button-return+)
+             (0 (store-api-key (field-string field)))
+             (2 (store-api-key "")))
+           (and (api-key) t))
+      (objc:release field)
+      (objc:release alert))))
+
+(define-controller-method ("setAPIKey:" :void) ((sender objc:objc-object-pointer))
+  (handler-case (unless (ask-for-api-key)
+                  (set-checked (controller-claude-checkbox self) nil))
+    (error (condition)
+      (setf (controller-message self) (condition-text condition))))
+  (save-settings self)
+  (refresh-controls self))
+
+(define-controller-method ("claudeChanged:" :void) ((sender objc:objc-object-pointer))
+  (when (and (claude-p self) (null (api-key)))
+    (unless (ignore-errors (ask-for-api-key))
+      (set-checked (controller-claude-checkbox self) nil)))
+  (save-settings self)
+  (refresh-controls self))
 
 (defun show-window (controller)
   (objc:invoke (controller-window controller) "makeKeyAndOrderFront:" (cffi:null-pointer))

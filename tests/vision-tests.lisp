@@ -92,3 +92,60 @@
                (is (= 0 (cffi:mem-aref bytes :uint8 (* 3 40 39))))
                (id::cf-release data))
           (id::cf-release cg))))))
+
+(test what-a-camera-records-is-read
+  (if (not (account-picture "Zebra"))
+      (skip "No account pictures")
+      (with-temporary-directory (dir)
+        (let ((photo (make-photo (path dir "geo.jpg") :date "2023:07:04 18:22:01"
+                                                      :latitude 37.7459d0 :longitude -119.5332d0)))
+          (multiple-value-bind (date location) (id::photo-metadata photo)
+            (is (equal '(2023 7 4) date))
+            (is (< (abs (- 37.7459d0 (car location))) 1d-4))
+            (is (< (abs (- -119.5332d0 (cdr location))) 1d-4))))
+        ;; Nothing recorded, nothing made up: not the file's own date.
+        (multiple-value-bind (date location) (id::photo-metadata (account-picture "Zebra"))
+          (is (null date))
+          (is (null location))))))
+
+(test the-orientation-a-camera-records-is-used
+  (if (not (account-picture "Zebra"))
+      (skip "No account pictures")
+      (with-temporary-directory (dir)
+        (let ((photo (make-photo (path dir "turned.jpg") :orientation 6)))
+          (multiple-value-bind (image orientation) (id::load-for-vision photo)
+            (im:destroy image)
+            (is (= 6 orientation)))))))
+
+(test codes-are-read
+  (with-temporary-directory (dir)
+    (let ((analysis (id:analyze-image (make-qr-code (path dir "qr.png") "https://example.com/lisp"))))
+      (is (equal '("https://example.com/lisp") (id::analysis-codes analysis)))
+      (is (search "Code: https://example.com/lisp" (id:compose-description analysis))))))
+
+(test core-graphics-calls-do-not-trap
+  ;; Writing a JPEG with an orientation is a floating point overflow inside
+  ;; ImageIO, which SBCL traps unless masked.
+  (if (not (account-picture "Zebra"))
+      (skip "No account pictures")
+      (with-temporary-directory (dir)
+        (finishes (make-photo (path dir "o.jpg") :orientation 8)))))
+
+(test stop-cancels-vision
+  (with-temporary-directory (dir)
+    (let* ((file (text-image (format nil "~{~a~^ ~}" (loop repeat 30 collect "cancel"))
+                             (path dir "long.png") :font-size 120))
+           (outcome nil)
+           (thread (sb-thread:make-thread
+                    (lambda ()
+                      (setf outcome (handler-case (progn (id:analyze-image file) :finished)
+                                      (error () :cancelled)))))))
+      (loop repeat 500
+            until (sb-thread:with-mutex (id::*requests-lock*)
+                    (gethash thread id::*requests-in-flight*))
+            do (sleep 0.01))
+      (id::cancel-requests (list thread))
+      (is-true (sb-thread:join-thread thread :timeout 30 :default nil))
+      (is (member outcome '(:cancelled :finished)))
+      ;; Nothing is left registered.
+      (is (null (gethash thread id::*requests-in-flight*))))))

@@ -1,0 +1,94 @@
+# Test, build and check the bundle on a GitHub macOS runner.
+#
+# GitHub's macOS images have a logged-in session and a WindowServer, so the
+# window tests run (the skip count says if that ever changes), and Vision runs
+# on the runner's own Mac.  im and asdf-macos-app come from checkouts beside
+# this one, as the Makefile expects; IM's libraries from the lispnik/tecgraf tap.
+#
+# The live tests -- Anthropic, the Keychain, Apple's geocoder, Finder -- are
+# skipped here: each needs a variable set (tests/package.lisp, LIVE-P).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install SBCL and IM
+        run: |
+          brew install sbcl
+          brew tap lispnik/tecgraf
+          brew install lispnik/tecgraf/tecgraf-im
+
+      - name: Check out im and asdf-macos-app beside this one
+        run: |
+          git clone --depth 1 https://github.com/lispnik/im.git ../im
+          git clone --depth 1 https://github.com/lispnik/asdf-macos-app.git ../asdf-macos-app
+
+      - name: Install ocicl
+        run: |
+          # As objc's CI does: a watchdog and three attempts, because one run
+          # sat in this step for the whole job budget.
+          attempt_with_timeout() {
+            local secs=$1; shift
+            ( "$@" ) & local pid=$!
+            ( sleep "$secs"; kill -9 "$pid" 2>/dev/null ) & local watchdog=$!
+            local rc=0; wait "$pid" || rc=$?
+            kill -9 "$watchdog" 2>/dev/null || true
+            return $rc
+          }
+          install_ocicl() {
+            rm -rf "$HOME/ocicl-src"
+            git clone --depth 1 https://github.com/ocicl/ocicl.git "$HOME/ocicl-src" &&
+              ( cd "$HOME/ocicl-src" && sbcl --non-interactive --load setup.lisp )
+          }
+          for attempt in 1 2 3; do
+            attempt_with_timeout 600 install_ocicl && break
+            [ "$attempt" = 3 ] && { echo "::error::ocicl could not be installed"; exit 1; }
+            sleep 15
+          done
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Restore dependencies
+        run: |
+          ocicl setup
+          # ocicl exits 0 when a download fails; look for it.
+          for attempt in 1 2 3 4 5; do
+            ocicl install 2>&1 | tee ocicl-install.log
+            grep -q "failed to install" ocicl-install.log || break
+            sleep 30
+          done
+          ! grep -q "failed to install" ocicl-install.log
+
+      - name: Test
+        run: make test
+
+      - name: Build the bundle
+        run: make app
+
+      - name: Run the bundle on the account pictures
+        run: |
+          make samples
+          open -W --env IMAGE_DESCRIBE_SELFTEST="$PWD/build/Sample Pictures" "build/Image Describer.app"
+          cat ~/Library/Logs/"Image Describer.log"
+          grep -q "done: " ~/Library/Logs/"Image Describer.log"
+          # And from a terminal, as a script would.
+          IMAGE_DESCRIBER_APP="$PWD/build/Image Describer.app" \
+            tools/image-describe --json "build/Sample Pictures/Animals/Zebra.heic" | tee zebra.json
+          grep -q '"description":"Zebra' zebra.json
+
+      - name: Keep the bundle
+        run: cd build && ditto -c -k --keepParent "Image Describer.app" "Image Describer.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Image Describer (ad hoc signed)
+          path: build/Image Describer.zip

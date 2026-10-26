@@ -5,7 +5,11 @@
 #   make run     run the application from source, unbundled
 #   make app     build "build/Image Describer.app"
 #   make icon    draw res/icon.png again, from tools/icon.lisp
-#   make screenshot INPUT=folder   draw the window into doc/, describing FOLDER
+#   make screenshot [INPUT=folder]  draw the window into doc/, describing FOLDER
+#                (by default copies of the account pictures macOS ships)
+#   make notarize  have Apple notarise the bundle (Developer ID, NOTARY_PROFILE)
+#   make dist    build/Image Describer.zip, the notarised bundle to hand out
+#   make install-cli  put the image-describe command in $(PREFIX)/bin
 #   make clean   remove the bundle and the fasls
 #
 # im is not in the ocicl registry, so it comes from a checkout: IM_DIR, by
@@ -42,7 +46,12 @@ REGISTRY = (asdf:initialize-source-registry \
 LISP = $(SBCL) --non-interactive --no-userinit --no-sysinit \
          --eval '(require :asdf)' --eval '$(REGISTRY)'
 
-.PHONY: deps test run app icon screenshot clean
+# A profile made once with `xcrun notarytool store-credentials NAME`.
+NOTARY_PROFILE ?= notary
+PREFIX ?= /usr/local
+APP = build/Image Describer.app
+
+.PHONY: deps test run app icon samples screenshot notarize dist install-cli clean
 
 deps:
 	ocicl install
@@ -63,10 +72,37 @@ icon:
 	        --load tools/icon.lisp \
 	        --eval '(image-describe-icon:main)'
 
-screenshot:
+# The account pictures in /Library/User Pictures, in a folder whose name
+# reads well in the picture.
+SAMPLES = $(CURDIR)/build/Sample Pictures
+INPUT ?= $(SAMPLES)
+
+samples:
+	mkdir -p "$(SAMPLES)/Animals" "$(SAMPLES)/Flowers" "$(SAMPLES)/Nature"
+	for d in Animals Flowers Nature; do \
+	  cp "/Library/User Pictures/$$d/"*.heic "$(SAMPLES)/$$d/" ; done
+	xattr -d com.apple.metadata:kMDItemFinderComment "$(SAMPLES)"/*/*.heic 2>/dev/null || true
+
+screenshot: $(if $(filter $(SAMPLES),$(INPUT)),samples)
 	INPUT="$(INPUT)" $(LISP) --eval '(asdf:load-system "image-describe")' \
 	        --load tools/screenshot.lisp \
 	        --eval '(image-describe-screenshot:main)'
+
+notarize:
+	@codesign -dv "$(APP)" 2>&1 | grep -q "Authority=Developer ID Application" || \
+	  { echo "$(APP) is not signed with a Developer ID: set MACOS_SIGNING_IDENTITY (local.mk) and make app"; exit 1; }
+	$(LISP) --eval '(asdf:load-system "asdf-macos-app")' \
+	        --eval '(macos-app:notarize "$(APP)" :keychain-profile "$(NOTARY_PROFILE)")'
+	spctl --assess --type execute --verbose "$(APP)"
+
+dist: notarize
+	cd build && rm -f "Image Describer.zip" && \
+	  ditto -c -k --keepParent "Image Describer.app" "Image Describer.zip"
+	@echo "build/Image Describer.zip"
+
+install-cli:
+	install -d "$(PREFIX)/bin"
+	install -m 755 tools/image-describe "$(PREFIX)/bin/image-describe"
 
 clean:
 	rm -rf build

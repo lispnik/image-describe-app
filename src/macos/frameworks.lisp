@@ -12,8 +12,8 @@
   "Bring up the Objective-C runtime with AppKit and Vision in it.  Every entry
 point that touches AppKit calls this first; in the bundle it is also what
 rebuilds the classes defined here."
-  (objc:ensure-objc-initialized
-   :modules (list +cocoa-framework+ +core-graphics-framework+ +vision-framework+)))
+  (objc:ensure-objc-initialized :modules (list +cocoa-framework+))
+  (ensure-vision))
 
 ;;; Constants -------------------------------------------------------------------
 
@@ -50,14 +50,3 @@ the ones that run while the window is resized or a panel is up, so that
 choosing a folder does not stop the rest being identified.")
 
 ;;; Small things ------------------------------------------------------------------
-
-(defvar *log* nil
-  "Where NOTE writes: the application's log, once MAIN has said so.")
-
-(defun note (control &rest arguments)
-  "Write a line to the log."
-  (when *log*
-    (ignore-errors
-     (multiple-value-bind (second minute hour) (get-decoded-time)
-       (format *log* "~&~2,'0d:~2,'0d:~2,'0d ~?~%" hour minute second control arguments))
-     (finish-output *log*))))

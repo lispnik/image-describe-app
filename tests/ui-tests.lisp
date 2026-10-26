@@ -18,28 +18,28 @@
 (def-suite ui :in all-tests :description "The window.  Needs a window server.")
 (in-suite ui)
 
-(defun call-with-controller (function)
+(defun call-with-controller (function &key previews background)
   (let ((controller nil)
-        (id::*remember-settings* nil))
+        (id::*remember-settings* nil)
+        (id::*list-in-background* background))
     (unwind-protect
          (objc:with-autorelease-pool ()
            ;; No policy, so no Dock icon and no stolen focus.
            (objc.runloop:shared-application :activation-policy nil)
-           (setf controller (id::make-window-controller))
+           (setf controller (id::make-window-controller :previews previews))
            (funcall function controller))
       (when controller
         ;; No worker left reading a folder about to be deleted.
-        (id::stop-and-wait controller)
-        (setf (id::controller-run controller) nil)
-        (objc:invoke (id::controller-window controller) "close")))))
+        (id::close-window-controller controller)))))
 
-(defmacro with-controller ((controller) &body body)
-  "Run BODY with CONTROLLER a new window controller, or skip."
+(defmacro with-controller ((controller &rest options) &body body)
+  "Run BODY with CONTROLLER a new window controller, or skip.  OPTIONS:
+:PREVIEWS for the preview thread, :BACKGROUND to list folders on a thread."
   `(cond ((not (ignore-errors (id::ensure-frameworks) t))
           (skip "Objective-C runtime not available"))
          ((not (objc.runloop:window-server-p))
           (skip "no window server"))
-         (t (call-with-controller (lambda (,controller) ,@body)))))
+         (t (call-with-controller (lambda (,controller) ,@body) ,@options))))
 
 (defun target (controller) (objc:objc-object-pointer controller))
 (defun table (controller) (id::controller-table controller))
@@ -301,3 +301,139 @@
                (is (equal '("" "" "") (column-cells controller "status")))
                (is (search "2 images still being read were left" (status-line controller))))
           (sb-thread:signal-semaphore release 10))))))
+
+;;; Listing and previews on threads of their own ---------------------------------
+
+(defun pump (controller selector predicate &key (timeout 30))
+  "Send SELECTOR to the controller, as the run loop would when a thread asks
+for it, until PREDICATE is true or TIMEOUT seconds pass."
+  (loop with deadline = (+ (get-internal-real-time) (* timeout internal-time-units-per-second))
+        until (or (funcall predicate) (> (get-internal-real-time) deadline))
+        do (sleep 0.02)
+           (send controller selector))
+  (funcall predicate))
+
+(test the-folder-is-listed-off-the-main-thread
+  (with-temporary-directory (dir)
+    (dotimes (i 5) (make-sample (path dir (format nil "~d.png" i))))
+    (with-controller (controller :background t)
+      (open-folder controller dir)
+      ;; Asked for, and not yet taken.
+      (is (search "Listing" (status-line controller)))
+      (is-true (pump controller "listingDone:" (lambda () (= 5 (row-count controller)))))
+      (is (search "5 images" (status-line controller)))
+      ;; An older listing's answer is not taken over a newer one's.
+      (open-folder controller "/no/such/folder")
+      (is (= 0 (row-count controller)))
+      (sleep 0.3)
+      (send controller "listingDone:")
+      (is (= 0 (row-count controller))))))
+
+(test the-preview-is-made-off-the-main-thread
+  (with-temporary-directory (dir)
+    (make-sample (path dir "a.png") :width 640 :height 480)
+    (with-controller (controller :previews t)
+      (open-folder controller dir)
+      (select controller 0)
+      (is-true (pump controller "previewReady:"
+                     (lambda () (not (null-object-p* (objc:invoke (id::controller-preview controller)
+                                                                  "image"))))))
+      ;; Kept: selecting it again shows it at once.
+      (select controller)
+      (is (null-object-p* (objc:invoke (id::controller-preview controller) "image")))
+      (select controller 0)
+      (is-false (null-object-p* (objc:invoke (id::controller-preview controller) "image"))))))
+
+(defun null-object-p* (object)
+  (or (null object) (cffi:null-pointer-p object)))
+
+;;; Undo, revert, drops, tags ------------------------------------------------------
+
+(defun undo (controller)
+  (objc:invoke (id::controller-undo-manager controller) "undo"))
+
+(defun redo (controller)
+  (objc:invoke (id::controller-undo-manager controller) "redo"))
+
+(test accepting-can-be-undone-and-redone
+  (with-temporary-directory (dir)
+    (make-sample (path dir "a.png"))
+    (make-sample (path dir "b.png"))
+    (id:write-description (path dir "b.png") "Before")
+    (with-controller (controller)
+      (open-folder controller dir)
+      (pretend-identified controller *dog* *cat*)
+      (send controller "acceptAll:")
+      (is (string= "Dog, canine, animal" (id:read-description (path dir "a.png"))))
+      (is (string= "Cat, feline, animal, sofa" (id:read-description (path dir "b.png"))))
+      (undo controller)
+      (is (null (id:read-description (path dir "a.png"))))
+      (is (string= "Before" (id:read-description (path dir "b.png"))))
+      (is (equal '("to review" "to review") (column-cells controller "status")))
+      (redo controller)
+      (is (string= "Dog, canine, animal" (id:read-description (path dir "a.png"))))
+      (is (equal '("saved" "saved") (column-cells controller "status"))))))
+
+(test removing-can-be-undone
+  (with-temporary-directory (dir)
+    (make-sample (path dir "a.png"))
+    (id:write-description (path dir "a.png") "Dog")
+    (with-controller (controller)
+      (open-folder controller dir)
+      (select controller 0)
+      (send controller "removeDescription:")
+      (is (null (id:read-description (path dir "a.png"))))
+      (undo controller)
+      (is (string= "Dog" (id:read-description (path dir "a.png"))))
+      (is (equal '("saved") (column-cells controller "status"))))))
+
+(test revert-goes-back-to-what-was-written-or-proposed
+  (with-temporary-directory (dir)
+    (make-sample (path dir "a.png"))
+    (make-sample (path dir "b.png"))
+    (id:write-description (path dir "b.png") "Written")
+    (with-controller (controller)
+      (open-folder controller dir)
+      (pretend-identified controller *dog*)
+      (select controller 0)
+      (type-description controller "Typed")
+      (is (string= "edited" (cell controller "status" 0)))
+      (send controller "revertDescription:")
+      (is (string= "Dog, canine, animal" (cell controller "description" 0)))
+      (is (string= "to review" (cell controller "status" 0)))
+      (select controller 1)
+      (type-description controller "Typed over")
+      (send controller "revertDescription:")
+      (is (string= "Written" (cell controller "description" 1)))
+      (is (string= "Written" (string-value (id::controller-editor controller)))))))
+
+(test dropped-images-are-shown-in-their-folder
+  (with-temporary-directory (dir)
+    (make-sample (path dir "one" "a.png"))
+    (make-sample (path dir "one" "b.png"))
+    (make-sample (path dir "two" "c.png"))
+    (with-controller (controller)
+      ;; One folder's images: that folder, those selected.
+      (id::open-paths controller (list (path dir "one" "b.png")))
+      (is (string= (path (id:canonical-path dir) "one") (id::folder-path controller)))
+      (is (equal '(1) (id::selected-rows controller)))
+      ;; Two folders' images: the folder holding both, with subfolders.
+      (id::open-paths controller (list (path dir "one" "a.png") (path dir "two" "c.png")))
+      (is (string= (id:canonical-path dir) (id::folder-path controller)))
+      (is (equal '("one/a.png" "one/b.png" "two/c.png") (column-cells controller "file")))
+      (is (equal '(0 2) (id::selected-rows controller)))
+      ;; A folder is the folder.
+      (id::open-paths controller (list (path dir "two")))
+      (is (equal '("c.png") (column-cells controller "file"))))))
+
+(test tags-are-written-when-chosen
+  (with-temporary-directory (dir)
+    (make-sample (path dir "a.png"))
+    (with-controller (controller)
+      (open-folder controller dir)
+      (id::set-checked (id::controller-tags-checkbox controller) t)
+      (pretend-identified controller *dog*)
+      (send controller "acceptAll:")
+      (is (equal '("Dog") (id::read-tags (path dir "a.png"))))
+      (undo controller)
+      (is (null (id::read-tags (path dir "a.png")))))))

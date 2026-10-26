@@ -18,7 +18,11 @@
                              (:file "describe")
                              (:file "xattr")
                              (:file "scan")
-                             (:file "batch"))))
+                             (:file "claude")
+                             (:file "places")
+                             (:file "finder")
+                             (:file "batch")
+                             (:file "cli"))))
   :in-order-to ((test-op (test-op "image-describe/tests"))))
 
 (defsystem "image-describe"
@@ -31,13 +35,14 @@
                 :pathname "src/macos/"
                 :serial t
                 :components ((:file "frameworks")
+                             (:file "preview")
                              (:file "window")
                              (:file "app"))))
   :in-order-to ((test-op (test-op "image-describe/tests"))))
 
 (defsystem "image-describe/tests"
   :description "The FiveAM suite."
-  :depends-on ("image-describe" "fiveam" (:require "sb-posix"))
+  :depends-on ("image-describe" "fiveam" (:require "sb-posix") (:require "sb-bsd-sockets"))
   :components ((:module "tests"
                 :serial t
                 :components ((:file "package")
@@ -46,7 +51,9 @@
                              (:file "xattr-tests")
                              (:file "scan-tests")
                              (:file "vision-tests")
+                             (:file "claude-tests")
                              (:file "batch-tests")
+                             (:file "cli-tests")
                              (:file "ui-tests"))))
   ;; FIVEAM:RUN! prints failures but returns NIL, and ASDF discards what a
   ;; TEST-OP returns, so the failure has to be an error.

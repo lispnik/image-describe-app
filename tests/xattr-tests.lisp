@@ -57,3 +57,22 @@
         (is (search "Permission denied" (princ-to-string condition)))))
     (signals error (id:write-description (path dir "missing.png") "Dog"))
     (is (null (id:read-description (path dir "missing.png"))))))
+
+(test tags-are-added-and-only-ours-taken-away
+  (with-temporary-directory (dir)
+    (let ((file (write-text (path dir "a.png") "")))
+      ;; Tags someone chose: one with a colour, and one this would add too.
+      (id::set-attribute file id::+tags-attribute+
+                         (id:encode-binary-plist (list (format nil "Holiday~%6") "Eagle")))
+      (id:write-description file "Eagle, raptor" :tags '("Eagle"))
+      (is (equal '("Holiday" "Eagle") (id::read-tags file)))
+      (id:write-description file "Owl, raptor" :tags '("Owl"))
+      ;; Eagle was theirs before it was ours: it stays.
+      (is (equal '("Holiday" "Eagle" "Owl") (id::read-tags file)))
+      (id:write-description file "Owl, raptor, night")    ; tags kept
+      (is (equal '("Holiday" "Eagle" "Owl") (id::read-tags file)))
+      (id:remove-description file)
+      (is (equal '("Holiday" "Eagle") (id::read-tags file)))
+      ;; Finder's colour is kept as it was.
+      (is (equal (list (format nil "Holiday~%6") "Eagle")
+                 (xattr-value file id::+tags-attribute+))))))

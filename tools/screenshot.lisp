@@ -1,6 +1,7 @@
 ;;;; screenshot.lisp -- a picture of the window, drawn by the window itself.
 ;;;;
-;;;;   make screenshot INPUT=/some/folder/of/images
+;;;;   make screenshot                      # the pictures macOS ships, copied
+;;;;   make screenshot INPUT=/some/folder   # or any folder
 ;;;;
 ;;;; Builds the real window over INPUT, identifies the images in it, selects
 ;;;; the first to review, and has AppKit draw the window into doc/window.png.
@@ -36,7 +37,8 @@
 
 (defun main ()
   (let ((input (uiop:getenv "INPUT"))
-        (id::*remember-settings* nil))
+        (id::*remember-settings* nil)
+        (id::*list-in-background* nil))
     (unless (and input (plusp (length input)))
       (error "Set INPUT to a folder of images."))
     (id::ensure-frameworks)
@@ -59,7 +61,13 @@
           (when (plusp (length (id::controller-entries controller)))
             (id::select-row controller row)
             (id::show-selection controller)
-            (id::refresh-controls controller)))
+            (id::refresh-controls controller)
+            ;; The preview is made on a thread of its own; wait for it.
+            (loop repeat 200
+                  until (let ((image (objc:invoke (id::controller-preview controller) "image")))
+                          (not (or (null image) (cffi:null-pointer-p image))))
+                  do (settle 0.05d0)
+                     (objc:invoke (objc:objc-object-pointer controller) "previewReady:" nil))))
         (objc:invoke window "makeFirstResponder:" (id::controller-table controller))
         (write-png (objc:invoke (objc:invoke window "contentView") "superview")
                    #p"doc/window.png")))))

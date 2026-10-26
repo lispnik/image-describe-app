@@ -72,3 +72,35 @@
   (is (null (id:description-keywords "Text: “Only text”")))
   ;; "Text:" only counts where a sentence begins.
   (is (equal '("context: maps") (id:description-keywords "context: maps"))))
+
+(test the-rest-of-what-was-found
+  (let ((analysis (id:make-analysis
+                   :labels '(("dog" . 0.9d0))
+                   :faces 2 :codes '("https://example.com")
+                   :date '(2023 7 4) :place "Yosemite National Park, CA, United States"
+                   :caption "Two hikers and their dog on a granite ledge.")))
+    (is (string= (concatenate 'string
+                              "Two hikers and their dog on a granite ledge. Dog. 2 people. "
+                              "Taken 4 July 2023 in Yosemite National Park, CA, United States. "
+                              "Code: https://example.com")
+                 (id:compose-description analysis)))
+    (is (string= "Two hikers and their dog on a granite ledge. Dog. 2 people. Taken 4 July 2023. Code: https://example.com"
+                 (id:compose-description analysis :include-place nil)))
+    (is (string= "Two hikers and their dog on a granite ledge. Dog. 2 people"
+                 (id:compose-description analysis :include-details nil)))
+    ;; The names of things, the people and the place; not the sentence, the
+    ;; date or the code.
+    (is (equal '("Dog" "2 people" "Yosemite National Park" "CA" "United States")
+               (id:description-keywords (id:compose-description analysis)))))
+  (is (string= "1 person" (id::people 1)))
+  (is (string= "Taken in Lisbon, Portugal"
+               (id::when-and-where (id:make-analysis :place "Lisbon, Portugal")))))
+
+(test animals-join-the-labels
+  (is (string= "Cat, animal"
+               (id:compose-description (id:make-analysis :labels '(("animal" . 0.5d0))
+                                                         :animals '(("Cat" . 0.9d0))))))
+  ;; Not twice.
+  (is (string= "Cat, animal"
+               (id:compose-description (id:make-analysis :labels '(("animal" . 0.9d0) ("cat" . 0.9d0))
+                                                         :animals '(("Cat" . 0.95d0)))))))

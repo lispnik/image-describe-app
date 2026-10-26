@@ -1,0 +1,17 @@
+#!/bin/sh
+# image-describe -- Image Describer from a terminal.  See `image-describe --help`.
+#
+# The application's own executable, run with arguments, is the command-line
+# program; this finds it.  IMAGE_DESCRIBER_APP names the bundle if it is not
+# in /Applications or ~/Applications.
+#
+# The executable is SBCL's runtime, which prints its banner and takes
+# --help and --version for itself unless told otherwise: --noinform and
+# --end-runtime-options leave the output and the arguments to the program.
+for app in "$IMAGE_DESCRIBER_APP" "/Applications/Image Describer.app" "$HOME/Applications/Image Describer.app"; do
+  if [ -n "$app" ] && [ -x "$app/Contents/MacOS/image-describe" ]; then
+    exec "$app/Contents/MacOS/image-describe" --noinform --end-runtime-options "$@"
+  fi
+done
+echo "image-describe: Image Describer.app is not in /Applications; set IMAGE_DESCRIBER_APP" >&2
+exit 2

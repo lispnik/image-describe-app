@@ -54,23 +54,40 @@
     (:nothing "nothing found")
     (:error "error")))
 
+(defun entry-for (path root)
+  "An entry for the image at PATH, with the description it already carries."
+  (let ((saved (read-description path)))
+    (make-entry :path path :relative (relative-name path root)
+                :saved saved :description saved)))
+
 (defun entries-from-directory (directory &key recursive)
   "An entry for each image in DIRECTORY, with the description each file
 already carries."
   (let ((root (canonical-path directory)))
-    (map 'vector
-         (lambda (path)
-           (let ((saved (read-description path)))
-             (make-entry :path path :relative (relative-name path root)
-                         :saved saved :description saved)))
+    (map 'vector (lambda (path) (entry-for path root))
          (scan-directory directory :recursive recursive))))
+
+(defun start-listing (directory &key recursive on-done)
+  "List DIRECTORY's images as ENTRIES-FROM-DIRECTORY does, on a thread of its
+own, and call ON-DONE there with the vector of entries, or with NIL and the
+reason it could not.  Answers the thread.
+
+A folder of fifty thousand images on a USB disk takes a while to list, and
+each file's attributes are read; done on the main thread, that was a window
+that did not answer."
+  (sb-thread:make-thread
+   (lambda ()
+     (multiple-value-bind (entries condition)
+         (ignore-errors (entries-from-directory directory :recursive recursive))
+       (funcall on-done entries (and condition (condition-text condition)))))
+   :name "list images"))
 
 (defun begin-identifying (entry)
   "Mark ENTRY as in a worker's hands."
   (setf (entry-message entry) nil
         (entry-status entry) :identifying))
 
-(defun identification (entry &key (read-text t))
+(defun identification (entry &key (read-text t) (caption *caption-function*))
   "Ask Vision what is in ENTRY's image, without changing ENTRY.  Answers a
 function of no arguments that records the answer in ENTRY: its analysis, or
 why not in its message.  Never signals.
@@ -79,7 +96,8 @@ The worker pool calls that function under its lock, and not at all if the run
 was abandoned meanwhile (ABANDON-BATCH): an image on a slow disk can take
 minutes, and by then the row is the main thread's again."
   (let ((analysis nil) (message nil))
-    (handler-case (setf analysis (analyze-image (entry-path entry) :read-text read-text))
+    (handler-case (setf analysis (analyze-image (entry-path entry)
+                                                :read-text read-text :caption caption))
       (serious-condition (condition)
         (setf message (condition-text condition))))
     (lambda ()
@@ -89,15 +107,15 @@ minutes, and by then the row is the main thread's again."
             (entry-message entry) message
             (entry-status entry) (if message :error :identified)))))
 
-(defun identify-entry (entry &key (read-text t))
+(defun identify-entry (entry &key (read-text t) (caption *caption-function*))
   "Identify ENTRY's image and record the answer in ENTRY.  Never signals;
 answers ENTRY."
   (begin-identifying entry)
-  (funcall (identification entry :read-text read-text))
+  (funcall (identification entry :read-text read-text :caption caption))
   entry)
 
 (defun propose-description (entry &key (minimum-confidence *default-minimum-confidence*)
-                                       (include-text t))
+                                       (include-text t) (include-place t))
   "Make ENTRY's description the one its analysis proposes, unless the user
 has typed one.  For the main thread.  Answers whether it changed."
   (when (and (entry-analysis entry)
@@ -105,17 +123,19 @@ has typed one.  For the main thread.  Answers whether it changed."
              (not (entry-edited entry)))
     (let ((proposed (compose-description (entry-analysis entry)
                                          :minimum-confidence minimum-confidence
-                                         :include-text include-text)))
+                                         :include-text include-text
+                                         :include-place include-place)))
       (unless (equal proposed (entry-description entry))
         (setf (entry-description entry) proposed)
         t))))
 
-(defun accept-entry (entry)
-  "Write ENTRY's description onto its file, or take it off if blank.
-For the main thread.  Answers true if it was written; if not, the message
-says why."
+(defun accept-entry (entry &key (tags :keep))
+  "Write ENTRY's description onto its file, or take it off if blank; TAGS as
+WRITE-DESCRIPTION takes them.  For the main thread.  Answers true if it was
+written; if not, the message says why."
   (handler-case
-      (let ((written (write-description (entry-path entry) (entry-description entry))))
+      (let ((written (write-description (entry-path entry) (entry-description entry)
+                                        :tags tags)))
         (setf (entry-saved entry) (if (blank-p written) nil written)
               (entry-description entry) (entry-saved entry)
               (entry-edited entry) nil
@@ -252,11 +272,13 @@ entry and as each worker ends."
   "Hand out no more entries, and record nothing more: those in hand are
 left to finish on their own, and what they find is thrown away.  Answers the
 indices of the entries that were in hand, whose rows are the caller's again."
-  (sb-thread:with-mutex ((run-lock run))
-    (setf (run-stopping run) t
-          (run-abandoned run) t)
-    (prog1 (run-in-hand run)
-      (setf (run-in-hand run) '()))))
+  (prog1 (sb-thread:with-mutex ((run-lock run))
+           (setf (run-stopping run) t
+                 (run-abandoned run) t)
+           (prog1 (run-in-hand run)
+             (setf (run-in-hand run) '())))
+    ;; Vision stops at once when asked; IM's reading cannot be stopped.
+    (cancel-requests (run-threads run))))
 
 (defun batch-done-p (run)
   "Whether every worker has ended, or the run was abandoned."

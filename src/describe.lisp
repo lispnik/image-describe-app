@@ -103,16 +103,59 @@ ellipsis if cut."
       (concatenate 'string (string (char-upcase (char text 0))) (subseq text 1))
       text))
 
+(defparameter +months+
+  #("January" "February" "March" "April" "May" "June" "July" "August" "September"
+    "October" "November" "December"))
+
+(defun when-and-where (analysis &key (include-place t))
+  "\"Taken 4 July 2023 in Portland, OR, United States\", or as much of it as
+is known, or NIL."
+  (let ((date (analysis-date analysis))
+        (place (and include-place (analysis-place analysis))))
+    (when (or date place)
+      (format nil "Taken~@[ ~a~]~@[ in ~a~]"
+              (and date (destructuring-bind (year month day) date
+                          (format nil "~d ~a ~d" day (aref +months+ (1- month)) year)))
+              place))))
+
+(defun people (faces)
+  (and (plusp faces) (format nil "~d ~:[people~;person~]" faces (= faces 1))))
+
+(defun with-animals (analysis)
+  "The labels, with any animal Vision recognised that they do not name."
+  (let ((labels (analysis-labels analysis)))
+    (dolist (animal (analysis-animals analysis))
+      (let ((name (string-downcase (car animal))))
+        (unless (find name labels :key #'car :test #'string-equal)
+          (setf labels (merge 'list (list (cons name (cdr animal))) (copy-list labels)
+                              #'> :key #'cdr)))))
+    labels))
+
 (defun compose-description (analysis &key (minimum-confidence *default-minimum-confidence*)
-                                          (include-text t))
-  "The description ANALYSIS proposes: what is in the image, most particular
-first, then any text read from it.  An empty string if nothing was found."
-  (let ((labels (mapcar (lambda (label) (humanize-label (car label)))
-                        (chosen-labels (analysis-labels analysis) minimum-confidence)))
-        (text (and include-text (found-text analysis))))
+                                          (include-text t) (include-details t)
+                                          (include-place t))
+  "The description ANALYSIS proposes, in short sentences: the caption, if
+one was asked for; what is in the image, most particular first; how many
+people; with INCLUDE-DETAILS, when and where it was taken and any barcode;
+then, with INCLUDE-TEXT, any text read from it.  An empty string if nothing
+was found."
+  (let* ((labels (mapcar (lambda (label) (humanize-label (car label)))
+                         (chosen-labels (with-animals analysis) minimum-confidence)))
+         (text (and include-text (found-text analysis)))
+         (pieces (remove nil
+                         (list (let ((caption (analysis-caption analysis)))
+                                 (and caption (plusp (length caption))
+                                      (string-right-trim "." caption)))
+                               (and labels (format nil "~{~a~^, ~}" labels))
+                               (people (analysis-faces analysis))
+                               (and include-details
+                                    (when-and-where analysis :include-place include-place))))))
+    (when include-details
+      (dolist (code (analysis-codes analysis))
+        (setf pieces (append pieces (list (format nil "Code: ~a" (shorten (collapse-spaces code) 100)))))))
     (capitalize-first
-     (format nil "~{~a~^, ~}~:[~;. ~]~@[Text: “~a”~]"
-             labels (and labels text) text))))
+     (format nil "~{~a~^. ~}~:[~;. ~]~@[Text: “~a”~]"
+             (mapcar #'capitalize-first pieces) (and pieces text) text))))
 
 (defun text-start (description)
   "Where \"Text:\" begins in DESCRIPTION: at its start or after a sentence."
@@ -128,24 +171,47 @@ first, then any text read from it.  An empty string if nothing was found."
 (defun word-count (text)
   (1+ (count #\Space (collapse-spaces text))))
 
-(defun description-keywords (description)
-  "The keywords written with DESCRIPTION: its comma- or semicolon-separated
-pieces, before any \"Text:\", that are a few words long -- the names of
-things, not sentences.  Each once, whatever its case."
-  (let* ((end (or (text-start description) (length description)))
-         (pieces '())
-         (start 0))
-    (loop for i from 0 to end
-          do (when (or (= i end) (member (char description i) '(#\, #\;)))
-               (push (subseq description start i) pieces)
+(defun split-on (text predicate)
+  "TEXT in the pieces between the positions PREDICATE is true of."
+  (let ((pieces '()) (start 0))
+    (loop for i from 0 to (length text)
+          do (when (or (= i (length text)) (funcall predicate i))
+               (push (subseq text start i) pieces)
                (setf start (1+ i))))
-    (let ((keywords '()))
-      (dolist (piece (nreverse pieces))
-        (let ((keyword (string-trim '(#\Space #\Tab #\Newline #\. #\“ #\” #\")
-                                    (collapse-spaces piece))))
-          (when (and (plusp (length keyword))
-                     (<= (word-count keyword) 4)
-                     (<= (length keyword) 64)
-                     (not (member keyword keywords :test #'string-equal)))
-            (push keyword keywords))))
-      (nreverse keywords))))
+    (nreverse pieces)))
+
+(defun sentences (text)
+  "TEXT's sentences: split at each full stop followed by a space."
+  (split-on text (lambda (i) (and (char= #\. (char text i))
+                                  (< (1+ i) (length text))
+                                  (char= #\Space (char text (1+ i)))))))
+
+(defun starts-with-p (prefix text)
+  (and (>= (length text) (length prefix))
+       (string-equal prefix text :end2 (length prefix))))
+
+(defun description-keywords (description)
+  "The keywords written with DESCRIPTION: the comma- or semicolon-separated
+pieces of its sentences that are a few words long -- the names of things,
+not sentences -- and the place in a \"Taken ... in ...\" sentence.  Not the
+text read from the image, nor a code.  Each once, whatever its case."
+  (let ((body (subseq description 0 (or (text-start description) (length description))))
+        (keywords '()))
+    (dolist (sentence (sentences body))
+      (let ((sentence (string-trim '(#\Space #\Tab #\Newline #\.) sentence)))
+        (cond ((starts-with-p "Code:" sentence))
+              ((starts-with-p "Taken" sentence)
+               (let ((in (search " in " sentence)))
+                 (when in
+                   (setf sentence (subseq sentence (+ in 4))))))
+              (t nil))
+        (unless (or (starts-with-p "Code:" sentence) (starts-with-p "Taken" sentence))
+          (dolist (piece (split-on sentence (lambda (i) (member (char sentence i) '(#\, #\;)))))
+            (let ((keyword (string-trim '(#\Space #\Tab #\Newline #\. #\“ #\” #\")
+                                        (collapse-spaces piece))))
+              (when (and (plusp (length keyword))
+                         (<= (word-count keyword) 4)
+                         (<= (length keyword) 64)
+                         (not (member keyword keywords :test #'string-equal)))
+                (push keyword keywords)))))))
+    (nreverse keywords)))
