@@ -128,6 +128,7 @@ make run          # run from source, unbundled
 make app          # build/Image Describer.app
 make notarize     # have Apple notarise it (Developer ID; see below)
 make dist         # build/Image Describer.zip, notarised, to hand out
+make dmg          # build/Image Describer.dmg, the bundle as it is, to drag to /Applications
 make install-cli  # the image-describe command
 make icon         # draw res/icon.png again
 make screenshot   # doc/window.png, from the account pictures macOS ships
@@ -177,7 +178,10 @@ skip without a window server. The suite needs no network.
 
 GitHub Actions (`.github/workflows/ci.yml`) runs the suite on a macOS runner,
 builds the bundle, runs it on the account pictures from a script, and keeps
-the ad hoc signed bundle as an artifact.
+the ad hoc signed bundle as an artifact. Publishing a release on GitHub
+does the same and then attaches `Image-Describer-<tag>.dmg` to the release.
+That bundle is signed ad hoc, so on another Mac it opens the first time with
+**Open** from the Finder's context menu.
 
 ### Checking the bundle from a script
 

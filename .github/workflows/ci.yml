@@ -7,6 +7,11 @@
 #
 # The live tests -- Apple's geocoder, Finder -- are
 # skipped here: each needs a variable set (tests/package.lisp, LIVE-P).
+#
+# Publishing a release on GitHub runs all this too, and then puts a disk
+# image of the bundle that passed on the release.  The bundle is signed ad
+# hoc, not with a Developer ID, so a downloaded copy needs Open from the
+# Finder's context menu the first time.
 name: CI
 
 on:
@@ -14,6 +19,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -92,3 +102,31 @@ jobs:
         with:
           name: Image Describer (ad hoc signed)
           path: build/Image Describer.zip
+
+  # On a release: the bundle the build job tested, as a disk image on it.
+  release:
+    needs: build
+    if: github.event_name == 'release'
+    runs-on: macos-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: Image Describer (ad hoc signed)
+          path: build
+
+      - name: Make the disk image
+        run: |
+          cd build && ditto -x -k "Image Describer.zip" . && cd ..
+          codesign --verify --deep "build/Image Describer.app"
+          make dmg DMG="build/Image-Describer-${GITHUB_REF_NAME}.dmg"
+          hdiutil verify "build/Image-Describer-${GITHUB_REF_NAME}.dmg"
+
+      - name: Put it on the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" "build/Image-Describer-${GITHUB_REF_NAME}.dmg" --clobber

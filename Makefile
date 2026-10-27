@@ -10,6 +10,7 @@
 #   make staged  doc/staged.png: the window part way through a review, on a backdrop
 #   make notarize  have Apple notarise the bundle (Developer ID, NOTARY_PROFILE)
 #   make dist    build/Image Describer.zip, the notarised bundle to hand out
+#   make dmg     build/Image Describer.dmg of the bundle as it is (DMG=name to rename)
 #   make install-cli  put the image-describe command in $(PREFIX)/bin
 #   make clean   remove the bundle and the fasls
 #
@@ -52,7 +53,7 @@ NOTARY_PROFILE ?= notary
 PREFIX ?= /usr/local
 APP = build/Image Describer.app
 
-.PHONY: deps test run app icon samples screenshot staged notarize dist install-cli clean
+.PHONY: deps test run app icon samples screenshot staged notarize dist dmg install-cli clean
 
 deps:
 	ocicl install
@@ -106,6 +107,22 @@ dist: notarize
 	cd build && rm -f "Image Describer.zip" && \
 	  ditto -c -k --keepParent "Image Describer.app" "Image Describer.zip"
 	@echo "build/Image Describer.zip"
+
+# The bundle and a link to /Applications, to drag it onto.  Signed with
+# MACOS_SIGNING_IDENTITY when there is one; notarise the bundle first for a
+# disk image that opens without a warning.
+DMG ?= build/Image Describer.dmg
+
+dmg:
+	rm -rf build/dmg "$(DMG)"
+	mkdir -p build/dmg
+	ditto "$(APP)" "build/dmg/Image Describer.app"
+	ln -s /Applications build/dmg/Applications
+	hdiutil create -volname "Image Describer" -srcfolder build/dmg -fs HFS+ \
+	  -format UDZO -imagekey zlib-level=9 -ov "$(DMG)"
+	rm -rf build/dmg
+	$(if $(MACOS_SIGNING_IDENTITY),codesign --sign "$(MACOS_SIGNING_IDENTITY)" --timestamp "$(DMG)")
+	@echo "$(DMG)"
 
 install-cli:
 	install -d "$(PREFIX)/bin"
