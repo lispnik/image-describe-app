@@ -134,8 +134,7 @@ is known, or NIL."
 (defun compose-description (analysis &key (minimum-confidence *default-minimum-confidence*)
                                           (include-text t) (include-details t)
                                           (include-place t))
-  "The description ANALYSIS proposes, in short sentences: the caption, if
-one was asked for; what is in the image, most particular first; how many
+  "The description ANALYSIS proposes, in short sentences: what is in the image, most particular first; how many
 people; with INCLUDE-DETAILS, when and where it was taken and any barcode;
 then, with INCLUDE-TEXT, any text read from it.  An empty string if nothing
 was found."
@@ -143,10 +142,7 @@ was found."
                          (chosen-labels (with-animals analysis) minimum-confidence)))
          (text (and include-text (found-text analysis)))
          (pieces (remove nil
-                         (list (let ((caption (analysis-caption analysis)))
-                                 (and caption (plusp (length caption))
-                                      (string-right-trim "." caption)))
-                               (and labels (format nil "~{~a~^, ~}" labels))
+                         (list (and labels (format nil "~{~a~^, ~}" labels))
                                (people (analysis-faces analysis))
                                (and include-details
                                     (when-and-where analysis :include-place include-place))))))

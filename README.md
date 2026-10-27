@@ -41,23 +41,12 @@ What is found, each in a short sentence of the description:
 | Where | its GPS position, named by Apple's geocoder — **Place names**, off unless chosen | *… in Half Dome, Yosemite National Park, CA, United States* |
 | Barcodes and QR codes | Vision | *Code: https://example.com* |
 | Text | Vision — **Text in images** | *Text: “STOP”* |
-| A sentence | Claude — **A sentence from Claude**, off unless chosen | *A bald eagle in profile against a black background.* |
 
 **Minimum confidence** is how sure Vision must be of a label for it to be in
 the description. Moving it, or turning text or places on or off, changes the
 proposals at once, without identifying again; descriptions you typed or
 accepted stay as they are. If nothing is that sure, the most likely thing is
 still proposed, provided it has a third of the minimum.
-
-**A sentence from Claude** sends each image, as a JPEG 1024 pixels across,
-to Anthropic's API (`claude-opus-5-5`), and the sentence that comes back
-leads the description. It costs about a cent an image, charged to the key's
-account; **Key…** keeps an API key in your login Keychain, and
-`ANTHROPIC_API_KEY`, if set, is used instead. Requests a safety classifier
-declines are retried by the API on a model chosen for the reason
-(`fallbacks: "default"`). Apple's own on-device model takes images only from
-macOS 27, so on macOS 26 there is no way to have the sentence without sending
-the image.
 
 Select an image to see it and its description below the list. Edit the
 description there and press **Return**: it is written onto the file and the
@@ -119,7 +108,7 @@ image-describe --apply review.jsonl               # write them
 image-describe -r --accept --tags --places ~/Pictures/Trip
 ```
 
-`--help` lists the rest: `--again`, `--no-text`, `--claude`,
+`--help` lists the rest: `--again`, `--no-text`,
 `--min-confidence`, `--workers`. Nothing is written without `--accept` or
 `--apply`. The exit status is 0, 1 if any image could not be identified or
 written, and 2 for a mistake in the arguments.
@@ -183,12 +172,7 @@ a profile not called `notary`).
 `make test` runs about 340 checks. The ones that need Vision to name
 something use the account pictures macOS ships in `/Library/User Pictures` (a
 zebra, an eagle…), and skip if they are not there; those that need the window
-skip without a window server. Claude's request and its error handling are
-checked against a small HTTP server in the test process, so the suite needs no
-key, no network, and costs nothing. The live checks are skipped unless asked
-for: `IMAGE_DESCRIBE_LIVE_CLAUDE=1` (asks Anthropic about the zebra, about a
-cent) and `IMAGE_DESCRIBE_LIVE_KEYCHAIN=1` (writes and removes a test item in
-the login Keychain).
+skip without a window server. The suite needs no network.
 
 GitHub Actions (`.github/workflows/ci.yml`) runs the suite on a macOS runner,
 builds the bundle, runs it on the account pictures from a script, and keeps
@@ -219,13 +203,12 @@ are identified at once.
 | `src/describe.lisp` | What was found as a description, and a description's keywords |
 | `src/xattr.lisp` | The description and tags on the file, in its extended attributes |
 | `src/scan.lisp` | Finding the images in a folder |
-| `src/claude.lisp` | A sentence from Claude, and the API key in the Keychain |
 | `src/places.lisp` | Place names from GPS positions, by CLGeocoder |
 | `src/finder.lisp` | Having Finder set Get Info comments |
 | `src/batch.lisp` | The rows, their states, the worker pool, listing in the background |
 | `src/cli.lisp` | The command line |
 | `src/macos/` | The window, previews made in the background, the menu, the Finder service and `main` |
-| `tests/` | FiveAM: property lists against `plutil`, descriptions, attributes against `xattr`, scanning, Vision, Claude against a stand-in server, the worker pool, the command line, and the real window driven without clicks |
+| `tests/` | FiveAM: property lists against `plutil`, descriptions, attributes against `xattr`, scanning, Vision, the worker pool, the command line, and the real window driven without clicks |
 | `tools/` | The icon, drawn pixel by pixel with IM; the screenshot tool; the `image-describe` command |
 
 ## Notes
@@ -260,8 +243,7 @@ are identified at once.
 - **Threads, and not Grand Central Dispatch.** As in image-converter-app: a
   stock SBCL stops the world for a collection by signalling every thread in
   Lisp, and macOS will not signal a GCD worker. The workers are SBCL threads;
-  each calls IM, CoreGraphics, Vision and (with Claude) NSURLConnection's
-  synchronous request through the Objective-C bridge, inside an autorelease
+  each calls IM, CoreGraphics and Vision through the Objective-C bridge, inside an autorelease
   pool of its own. None touches AppKit, and none touches a row's description:
   the main thread looks at what they have finished ten times a second and
   proposes the descriptions, so an edit made while a batch runs is never

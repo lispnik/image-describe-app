@@ -18,7 +18,6 @@
                              (:file "describe")
                              (:file "xattr")
                              (:file "scan")
-                             (:file "claude")
                              (:file "places")
                              (:file "finder")
                              (:file "batch")
@@ -42,7 +41,7 @@
 
 (defsystem "image-describe/tests"
   :description "The FiveAM suite."
-  :depends-on ("image-describe" "fiveam" (:require "sb-posix") (:require "sb-bsd-sockets"))
+  :depends-on ("image-describe" "fiveam" (:require "sb-posix"))
   :components ((:module "tests"
                 :serial t
                 :components ((:file "package")
@@ -51,7 +50,6 @@
                              (:file "xattr-tests")
                              (:file "scan-tests")
                              (:file "vision-tests")
-                             (:file "claude-tests")
                              (:file "batch-tests")
                              (:file "cli-tests")
                              (:file "ui-tests"))))

@@ -87,7 +87,7 @@ that did not answer."
   (setf (entry-message entry) nil
         (entry-status entry) :identifying))
 
-(defun identification (entry &key (read-text t) (caption *caption-function*))
+(defun identification (entry &key (read-text t))
   "Ask Vision what is in ENTRY's image, without changing ENTRY.  Answers a
 function of no arguments that records the answer in ENTRY: its analysis, or
 why not in its message.  Never signals.
@@ -96,8 +96,7 @@ The worker pool calls that function under its lock, and not at all if the run
 was abandoned meanwhile (ABANDON-BATCH): an image on a slow disk can take
 minutes, and by then the row is the main thread's again."
   (let ((analysis nil) (message nil))
-    (handler-case (setf analysis (analyze-image (entry-path entry)
-                                                :read-text read-text :caption caption))
+    (handler-case (setf analysis (analyze-image (entry-path entry) :read-text read-text))
       (serious-condition (condition)
         (setf message (condition-text condition))))
     (lambda ()
@@ -107,11 +106,11 @@ minutes, and by then the row is the main thread's again."
             (entry-message entry) message
             (entry-status entry) (if message :error :identified)))))
 
-(defun identify-entry (entry &key (read-text t) (caption *caption-function*))
+(defun identify-entry (entry &key (read-text t))
   "Identify ENTRY's image and record the answer in ENTRY.  Never signals;
 answers ENTRY."
   (begin-identifying entry)
-  (funcall (identification entry :read-text read-text :caption caption))
+  (funcall (identification entry :read-text read-text))
   entry)
 
 (defun propose-description (entry &key (minimum-confidence *default-minimum-confidence*)

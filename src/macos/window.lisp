@@ -23,7 +23,6 @@
    (recursive-checkbox :initform nil :accessor controller-recursive-checkbox)
    (text-checkbox :initform nil :accessor controller-text-checkbox)
    (places-checkbox :initform nil :accessor controller-places-checkbox)
-   (claude-checkbox :initform nil :accessor controller-claude-checkbox)
    (tags-checkbox :initform nil :accessor controller-tags-checkbox)
    (get-info-checkbox :initform nil :accessor controller-get-info-checkbox)
    (confidence-slider :initform nil :accessor controller-confidence-slider)
@@ -123,7 +122,6 @@ tests bind it to NIL, so as not to change the settings of whoever runs them.")
       (objc:invoke defaults "setBool:forKey:" (recursive-p controller) "IncludeSubfolders")
       (objc:invoke defaults "setBool:forKey:" (read-text-p controller) "ReadText")
       (objc:invoke defaults "setBool:forKey:" (places-p controller) "PlaceNames")
-      (objc:invoke defaults "setBool:forKey:" (claude-p controller) "UseClaude")
       (objc:invoke defaults "setBool:forKey:" (tags-p controller) "FinderTags")
       (objc:invoke defaults "setBool:forKey:" (get-info-p controller) "GetInfoComments")
       (objc:invoke defaults "setInteger:forKey:" (confidence-percent controller)
@@ -169,9 +167,6 @@ tests bind it to NIL, so as not to change the settings of whoever runs them.")
 
 (defun places-p (controller)
   (checked-p (controller-places-checkbox controller)))
-
-(defun claude-p (controller)
-  (checked-p (controller-claude-checkbox controller)))
 
 (defun tags-p (controller)
   (checked-p (controller-tags-checkbox controller)))
@@ -504,8 +499,7 @@ each, when it comes, goes into the proposal."
 (defun start-identifying (controller &optional rows)
   "Identify ROWS, or every row not identified yet.  True if it began."
   (let ((rows (or rows (pending-rows controller)))
-        (read-text (read-text-p controller))
-        (caption (and (claude-p controller) #'claude-caption)))
+        (read-text (read-text-p controller)))
     (setf (controller-message controller)
           (cond ((not (directory-exists-p (folder-path controller)))
                  "Choose a folder that exists.")
@@ -527,7 +521,7 @@ each, when it comes, goes into the proposal."
            (setf (controller-run controller)
                  (start-batch (controller-entries controller)
                               (lambda (entry)
-                                (identification entry :read-text read-text :caption caption))
+                                (identification entry :read-text read-text))
                               :begin #'begin-identifying
                               :indices rows)
                  (controller-stopping controller) nil)
@@ -1222,12 +1216,7 @@ find in each image, and what to write besides the comment and keywords."
               (controller-confidence-label controller)
               (add-label inner "" (vector (- width 52d0) (+ y2 3d0) 44d0 17d0) right))
         (setf (controller-places-checkbox controller)
-              (checkbox "Place names (asks Apple)" x y3 200d0 "settingsChanged:")
-              (controller-claude-checkbox controller)
-              (checkbox "A sentence from Claude (sends each image to Anthropic)" 310d0 y3 380d0
-                        "claudeChanged:"))
-        (add-button inner "Key…" "setAPIKey:" (vector (- width 106d0) (- y3 6d0) 100d0 32d0)
-                    right target)
+              (checkbox "Place names (asks Apple)" x y3 200d0 "settingsChanged:"))
         (add-label inner "Also:" (vector 8d0 (+ y4 3d0) 88d0 17d0) left :alignment 2)
         (setf (controller-tags-checkbox controller)
               (checkbox "Tag each in Finder with its first keyword" x y4 290d0 "settingsChanged:")
@@ -1272,9 +1261,6 @@ find in each image, and what to write besides the comment and keywords."
     (set-checked (controller-recursive-checkbox controller) (default-bool "IncludeSubfolders" nil))
     (set-checked (controller-text-checkbox controller) (default-bool "ReadText" t))
     (set-checked (controller-places-checkbox controller) (default-bool "PlaceNames" nil))
-    ;; Not on without a key to send.
-    (set-checked (controller-claude-checkbox controller)
-                 (and (default-bool "UseClaude" nil) (api-key) t))
     (set-checked (controller-tags-checkbox controller) (default-bool "FinderTags" nil))
     (set-checked (controller-get-info-checkbox controller) (default-bool "GetInfoComments" nil))
     (objc:invoke (controller-confidence-slider controller) "setIntegerValue:"
@@ -1416,53 +1402,6 @@ with subfolders if they are in several, and selected."
      (row :long)
      (operation (:unsigned :long)))
   (open-paths self (paths-from-pasteboard (objc:invoke info "draggingPasteboard"))))
-
-;;; Claude ----------------------------------------------------------------------------
-
-(defun ask-for-api-key ()
-  "Ask for an Anthropic API key and keep it in the Keychain.  Answers
-whether there is one afterwards."
-  (let ((alert (objc:invoke (objc:invoke "NSAlert" "alloc") "init"))
-        (field (objc:invoke (objc:invoke "NSSecureTextField" "alloc") "initWithFrame:"
-                            #(0d0 0d0 320d0 24d0))))
-    (unwind-protect
-         (progn
-           (objc:invoke alert "setMessageText:" "An Anthropic API key")
-           (objc:invoke alert "setInformativeText:"
-                        (format nil "With “A sentence from Claude”, each image is sent, as a ~
-JPEG 1024 pixels across, to Anthropic's API and ~a describes it in a sentence. ~
-That costs about a cent an image, charged to the key's account.~%~%The key is ~
-kept in your login Keychain.~@[ ANTHROPIC_API_KEY is set, and is used instead.~]"
-                                *claude-model*
-                                (let ((env (uiop:getenv "ANTHROPIC_API_KEY")))
-                                  (and env (plusp (length env))))))
-           (objc:invoke field "setPlaceholderString:" "sk-ant-…")
-           (objc:invoke alert "setAccessoryView:" field)
-           (objc:invoke alert "addButtonWithTitle:" "Keep")
-           (objc:invoke alert "addButtonWithTitle:" "Cancel")
-           (objc:invoke alert "addButtonWithTitle:" "Forget the Key")
-           (objc:invoke (objc:invoke alert "window") "setInitialFirstResponder:" field)
-           (case (- (objc:invoke alert "runModal") +ns-alert-first-button-return+)
-             (0 (store-api-key (field-string field)))
-             (2 (store-api-key "")))
-           (and (api-key) t))
-      (objc:release field)
-      (objc:release alert))))
-
-(define-controller-method ("setAPIKey:" :void) ((sender objc:objc-object-pointer))
-  (handler-case (unless (ask-for-api-key)
-                  (set-checked (controller-claude-checkbox self) nil))
-    (error (condition)
-      (setf (controller-message self) (condition-text condition))))
-  (save-settings self)
-  (refresh-controls self))
-
-(define-controller-method ("claudeChanged:" :void) ((sender objc:objc-object-pointer))
-  (when (and (claude-p self) (null (api-key)))
-    (unless (ignore-errors (ask-for-api-key))
-      (set-checked (controller-claude-checkbox self) nil)))
-  (save-settings self)
-  (refresh-controls self))
 
 (defun show-window (controller)
   (objc:invoke (controller-window controller) "makeKeyAndOrderFront:" (cffi:null-pointer))

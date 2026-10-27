@@ -5,7 +5,7 @@
 # on the runner's own Mac.  im and asdf-macos-app come from checkouts beside
 # this one, as the Makefile expects; IM's libraries from the lispnik/tecgraf tap.
 #
-# The live tests -- Anthropic, the Keychain, Apple's geocoder, Finder -- are
+# The live tests -- Apple's geocoder, Finder -- are
 # skipped here: each needs a variable set (tests/package.lisp, LIVE-P).
 name: CI
 

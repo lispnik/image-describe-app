@@ -26,8 +26,6 @@ description for each.  Nothing is written onto the images unless --accept.
       --json              print a JSON object a line: path, state, description
       --no-text           do not read text in the images
       --places            look up place names for GPS positions (network)
-      --claude            ask Claude for a sentence too (sends each image;
-                          key from ANTHROPIC_API_KEY or the app's Keychain item)
       --tags              with --accept, tag each image with its first keyword
       --min-confidence N  how sure Vision must be of a label, 5 to 95 (30)
       --workers N         images identified at once
@@ -56,7 +54,6 @@ description for each.  Nothing is written onto the images unless --accept.
                        ((string= argument "--json") (setf (getf options :json) t))
                        ((string= argument "--no-text") (setf (getf options :read-text) nil))
                        ((string= argument "--places") (setf (getf options :places) t))
-                       ((string= argument "--claude") (setf (getf options :claude) t))
                        ((string= argument "--tags") (setf (getf options :tags) t))
                        ((string= argument "--apply") (setf (getf options :apply) (value)))
                        ((string= argument "--min-confidence")
@@ -183,14 +180,10 @@ not be identified or written, 2 if the arguments were wrong."
                        for row from 0
                        when (or (getf options :again) (null (entry-saved entry)))
                          collect row))
-           (caption (and (getf options :claude) #'claude-caption))
            (read-text (getf options :read-text))
            (failed 0))
-      (when (and caption (null (api-key)))
-        (format err "~&image-describe: --claude needs a key: set ANTHROPIC_API_KEY, or set one in the app~%")
-        (return-from run-cli 2))
       (let ((run (start-batch entries
-                              (lambda (entry) (identification entry :read-text read-text :caption caption))
+                              (lambda (entry) (identification entry :read-text read-text))
                               :begin #'begin-identifying :indices rows
                               :workers (or (getf options :workers) *worker-count* (default-worker-count)))))
         (wait-for-batch run))
@@ -226,10 +219,7 @@ not be identified or written, 2 if the arguments were wrong."
                  (if (getf options :json)
                      (format out "~a~%" (json-line "path" (entry-path entry) "state" state
                                                    "description" (or (entry-description entry) "")
-                                                   "error" (entry-message entry)
-                                                   "caption_error" (and (entry-analysis entry)
-                                                                        (analysis-caption-error
-                                                                         (entry-analysis entry)))))
+                                                   "error" (entry-message entry)))
                      (format out "~a~c~a~c~a~%" (entry-path entry) #\Tab state #\Tab
                              (or (entry-message entry)
                                  (substitute #\Space #\Newline (or (entry-description entry) "")))))))

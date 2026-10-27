@@ -361,8 +361,6 @@ month day) (latitude . longitude)), either NIL if it does not say."
   (date nil)           ; (year month day) the photograph was taken
   (location nil)       ; (latitude . longitude)
   (place nil)          ; where LOCATION is, in words, once looked up
-  (caption nil)        ; a sentence from a language model, if one was asked
-  (caption-error nil)  ; why there is none, if one was asked
   (source :im))        ; :IM or :IMAGE-IO, whichever read the pixels
 
 (defparameter *lowest-kept-confidence* 0.05
@@ -456,15 +454,10 @@ meant to be sent from another thread."
       (let ((text (objc:ns-string-to-string payload)))
         (and (plusp (length text)) text)))))
 
-(defvar *caption-function* nil
-  "If not NIL, a function called with each image's CGImage that answers a
-sentence describing it, or signals why not: claude.lisp's, when asked for.")
-
-(defun analyze-image (path &key (read-text t) (caption *caption-function*))
+(defun analyze-image (path &key (read-text t))
   "What Vision finds in the image at native PATH, as an ANALYSIS: what is in
 it, any animals, faces and codes, and with READ-TEXT the text in it; when and
-where the photograph says it was taken; and with CAPTION, a function of a
-CGImage, a sentence from it.  Signals if the file cannot be read."
+where the photograph says it was taken.  Signals if the file cannot be read."
   (unless (probe-file (sb-ext:parse-native-namestring path))
     (error "The file is not there any more."))
   (ensure-vision)
@@ -488,23 +481,16 @@ CGImage, a sentence from it.  Signals if the file cannot be read."
                       (objc:invoke-with-error handler "performRequests:error:"
                                               (coerce requests 'vector)))
                     (multiple-value-bind (date location) (photo-metadata path)
-                      (let ((analysis
-                              (make-analysis
-                               :labels (stable-sort (results-list classify #'label-of) #'> :key #'cdr)
-                               :text (and text (results-list text #'line-of))
-                               :animals (results-list animals #'animal-of)
-                               :faces (length (results-list faces #'identity))
-                               :codes (remove-duplicates (results-list codes #'code-of)
-                                                         :test #'string= :from-end t)
-                               :date date
-                               :location location
-                               :source source)))
-                        (when caption
-                          (handler-case
-                              (setf (analysis-caption analysis) (funcall caption cg orientation))
-                            (error (condition)
-                              (setf (analysis-caption-error analysis) (condition-text condition)))))
-                        analysis)))
+                      (make-analysis
+                       :labels (stable-sort (results-list classify #'label-of) #'> :key #'cdr)
+                       :text (and text (results-list text #'line-of))
+                       :animals (results-list animals #'animal-of)
+                       :faces (length (results-list faces #'identity))
+                       :codes (remove-duplicates (results-list codes #'code-of)
+                                                 :test #'string= :from-end t)
+                       :date date
+                       :location location
+                       :source source)))
                (dolist (request (list classify animals faces codes text))
                  (when request (objc:release request)))
                (objc:release handler)))
