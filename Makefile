@@ -7,6 +7,7 @@
 #   make icon    draw res/icon.png again, from tools/icon.lisp
 #   make screenshot [INPUT=folder]  draw the window into doc/, describing FOLDER
 #                (by default copies of the account pictures macOS ships)
+#   make staged  doc/staged.png: the window part way through a review, on a backdrop
 #   make notarize  have Apple notarise the bundle (Developer ID, NOTARY_PROFILE)
 #   make dist    build/Image Describer.zip, the notarised bundle to hand out
 #   make install-cli  put the image-describe command in $(PREFIX)/bin
@@ -51,7 +52,7 @@ NOTARY_PROFILE ?= notary
 PREFIX ?= /usr/local
 APP = build/Image Describer.app
 
-.PHONY: deps test run app icon samples screenshot notarize dist install-cli clean
+.PHONY: deps test run app icon samples screenshot staged notarize dist install-cli clean
 
 deps:
 	ocicl install
@@ -87,6 +88,12 @@ screenshot: $(if $(filter $(SAMPLES),$(INPUT)),samples)
 	INPUT="$(INPUT)" $(LISP) --eval '(asdf:load-system "image-describe")' \
 	        --load tools/screenshot.lisp \
 	        --eval '(image-describe-screenshot:main)'
+
+staged:
+	$(LISP) --eval '(asdf:load-system "image-describe")' \
+	        --eval '(asdf:load-system "image-describe/tests")' \
+	        --load tools/staged.lisp \
+	        --eval '(image-describe-staged:main)'
 
 notarize:
 	@codesign -dv "$(APP)" 2>&1 | grep -q "Authority=Developer ID Application" || \

@@ -13,7 +13,7 @@ Built with SBCL, [objc](https://github.com/lispnik/objc) for AppKit and Vision,
 tests and ocicl for the dependencies. A sibling of image-converter-app, and
 built the same way.
 
-![The window after identifying a folder: the eagle selected, its proposed description ready to accept](doc/window.png)
+![Image Describer part way through a folder: three descriptions saved, one retyped, and a photograph selected with the date and place it was taken](doc/staged.png)
 
 ## Using it
 
@@ -131,6 +131,7 @@ make dist         # build/Image Describer.zip, notarised, to hand out
 make install-cli  # the image-describe command
 make icon         # draw res/icon.png again
 make screenshot   # doc/window.png, from the account pictures macOS ships
+make staged       # doc/staged.png, the picture at the top: a review part way through
 ```
 
 ```sh
@@ -209,7 +210,7 @@ are identified at once.
 | `src/cli.lisp` | The command line |
 | `src/macos/` | The window, previews made in the background, the menu, the Finder service and `main` |
 | `tests/` | FiveAM: property lists against `plutil`, descriptions, attributes against `xattr`, scanning, Vision, the worker pool, the command line, and the real window driven without clicks |
-| `tools/` | The icon, drawn pixel by pixel with IM; the screenshot tool; the `image-describe` command |
+| `tools/` | The icon, drawn pixel by pixel with IM; the screenshot tools; the `image-describe` command |
 
 ## Notes
 
