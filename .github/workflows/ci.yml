@@ -14,12 +14,16 @@
 # and the disk image are notarised and stapled, so they open on any Mac
 # without a warning:
 #
-#   MACOS_CERTIFICATE           the Developer ID Application identity, a .p12, base64
+#   MACOS_CERTIFICATE_P12       the Developer ID Application certificate and
+#                               its key, exported as .p12, base64
 #   MACOS_CERTIFICATE_PASSWORD  the .p12's password
-#   APPLE_ID                    the Apple Account that notarises
-#   APPLE_APP_PASSWORD          an app-specific password for it (account.apple.com)
-#   APPLE_TEAM_ID               the team (Q47YS469F2)
+#   MACOS_SIGNING_IDENTITY      its name, as `security find-identity` prints it
+#   NOTARY_KEY_P8               an App Store Connect API key (.p8), base64
+#   NOTARY_KEY_ID               its key ID
+#   NOTARY_ISSUER               its issuer ID
 #
+# tools/set-github-secrets.sh checks and sets them -- the same six as
+# ftp-server-app's, so one set of files does for both.
 # Without them -- and on every push -- the bundle is signed ad hoc.
 name: CI
 
@@ -39,7 +43,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 60
     env:
-      SIGNED_RELEASE: ${{ github.event_name == 'release' && secrets.MACOS_CERTIFICATE != '' }}
+      SIGNED_RELEASE: ${{ github.event_name == 'release' && secrets.MACOS_CERTIFICATE_P12 != '' && secrets.NOTARY_KEY_P8 != '' }}
     steps:
       - uses: actions/checkout@v5
 
@@ -95,11 +99,12 @@ jobs:
       - name: Load the Developer ID
         if: env.SIGNED_RELEASE == 'true'
         env:
-          CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE_P12 }}
           CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.NOTARY_ISSUER }}
         run: |
           keychain="$RUNNER_TEMP/signing.keychain-db"
           keychain_password=$(uuidgen)
@@ -112,12 +117,14 @@ jobs:
           rm "$RUNNER_TEMP/certificate.p12"
           security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" >/dev/null
           security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
-          identity=$(security find-identity -v -p codesigning "$keychain" |
-                       awk '/Developer ID Application/ { print $2; exit }')
-          [ -n "$identity" ] || { echo "::error::No Developer ID Application identity in MACOS_CERTIFICATE"; exit 1; }
-          echo "MACOS_SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
+          security find-identity -v -p codesigning "$keychain" | grep -qF "\"$IDENTITY\"" ||
+            { echo "::error::MACOS_CERTIFICATE_P12 does not hold \"$IDENTITY\""; exit 1; }
+          echo "MACOS_SIGNING_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          # The API key as the keychain profile make notarize names.
+          echo "$NOTARY_KEY_P8" | base64 --decode > "$RUNNER_TEMP/notary.p8"
           xcrun notarytool store-credentials notary --keychain "$keychain" \
-            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD"
+            --key "$RUNNER_TEMP/notary.p8" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER"
+          rm -f "$RUNNER_TEMP/notary.p8"
 
       - name: Build the bundle
         run: make app

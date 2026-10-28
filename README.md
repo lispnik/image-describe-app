@@ -180,11 +180,15 @@ GitHub Actions (`.github/workflows/ci.yml`) runs the suite on a macOS runner,
 builds the bundle, runs it on the account pictures from a script, and keeps
 the ad hoc signed bundle as an artifact. Publishing a release on GitHub
 does the same and then attaches `Image-Describer-<tag>.dmg` to the release.
-With the repository secrets listed at the top of the workflow (the Developer
-ID as a .p12, and an Apple Account to notarise with), a release's bundle and
-disk image are signed with the Developer ID, notarised and stapled; without
-them they are signed ad hoc, and on another Mac open the first time with
-**Open** from the Finder's context menu.
+With six repository secrets -- the Developer ID as a `.p12` and an App Store
+Connect API key (`.p8`) to notarise with -- a release's bundle and disk image
+are signed with the Developer ID, notarised and stapled; without them they are
+signed ad hoc, and on another Mac open the first time with **Open** from the
+Finder's context menu. `tools/set-github-secrets.sh` sets them, the same six
+as ftp-server-app's: fill in the paths and the key's two IDs at its top and
+run it, with `--dry-run` first. It checks that the password opens the `.p12`
+and that it holds the Developer ID and its key. The comments at its top say
+where each thing comes from.
 
 ### Checking the bundle from a script
 
