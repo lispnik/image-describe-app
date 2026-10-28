@@ -11,6 +11,7 @@
 #   make notarize  have Apple notarise the bundle (Developer ID, NOTARY_PROFILE)
 #   make dist    build/Image Describer.zip, the notarised bundle to hand out
 #   make dmg     build/Image Describer.dmg of the bundle as it is (DMG=name to rename)
+#   make notarize-dmg  have Apple notarise that disk image too, and staple it
 #   make install-cli  put the image-describe command in $(PREFIX)/bin
 #   make clean   remove the bundle and the fasls
 #
@@ -53,7 +54,7 @@ NOTARY_PROFILE ?= notary
 PREFIX ?= /usr/local
 APP = build/Image Describer.app
 
-.PHONY: deps test run app icon samples screenshot staged notarize dist dmg install-cli clean
+.PHONY: deps test run app icon samples screenshot staged notarize dist dmg notarize-dmg install-cli clean
 
 deps:
 	ocicl install
@@ -123,6 +124,11 @@ dmg:
 	rm -rf build/dmg
 	$(if $(MACOS_SIGNING_IDENTITY),codesign --sign "$(MACOS_SIGNING_IDENTITY)" --timestamp "$(DMG)")
 	@echo "$(DMG)"
+
+notarize-dmg:
+	xcrun notarytool submit "$(DMG)" --keychain-profile "$(NOTARY_PROFILE)" --wait
+	xcrun stapler staple "$(DMG)"
+	spctl --assess --type open --context context:primary-signature -v "$(DMG)"
 
 install-cli:
 	install -d "$(PREFIX)/bin"

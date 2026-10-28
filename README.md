@@ -180,7 +180,10 @@ GitHub Actions (`.github/workflows/ci.yml`) runs the suite on a macOS runner,
 builds the bundle, runs it on the account pictures from a script, and keeps
 the ad hoc signed bundle as an artifact. Publishing a release on GitHub
 does the same and then attaches `Image-Describer-<tag>.dmg` to the release.
-That bundle is signed ad hoc, so on another Mac it opens the first time with
+With the repository secrets listed at the top of the workflow (the Developer
+ID as a .p12, and an Apple Account to notarise with), a release's bundle and
+disk image are signed with the Developer ID, notarised and stapled; without
+them they are signed ad hoc, and on another Mac open the first time with
 **Open** from the Finder's context menu.
 
 ### Checking the bundle from a script

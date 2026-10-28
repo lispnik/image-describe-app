@@ -9,9 +9,18 @@
 # skipped here: each needs a variable set (tests/package.lisp, LIVE-P).
 #
 # Publishing a release on GitHub runs all this too, and then puts a disk
-# image of the bundle that passed on the release.  The bundle is signed ad
-# hoc, not with a Developer ID, so a downloaded copy needs Open from the
-# Finder's context menu the first time.
+# image of the bundle that passed on the release.  For a release, with these
+# repository secrets set, the bundle is signed with a Developer ID, and it
+# and the disk image are notarised and stapled, so they open on any Mac
+# without a warning:
+#
+#   MACOS_CERTIFICATE           the Developer ID Application identity, a .p12, base64
+#   MACOS_CERTIFICATE_PASSWORD  the .p12's password
+#   APPLE_ID                    the Apple Account that notarises
+#   APPLE_APP_PASSWORD          an app-specific password for it (account.apple.com)
+#   APPLE_TEAM_ID               the team (Q47YS469F2)
+#
+# Without them -- and on every push -- the bundle is signed ad hoc.
 name: CI
 
 on:
@@ -28,7 +37,9 @@ permissions:
 jobs:
   build:
     runs-on: macos-latest
-    timeout-minutes: 40
+    timeout-minutes: 60
+    env:
+      SIGNED_RELEASE: ${{ github.event_name == 'release' && secrets.MACOS_CERTIFICATE != '' }}
     steps:
       - uses: actions/checkout@v5
 
@@ -81,8 +92,39 @@ jobs:
       - name: Test
         run: make test
 
+      - name: Load the Developer ID
+        if: env.SIGNED_RELEASE == 'true'
+        env:
+          CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password=$(uuidgen)
+          echo "$CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" \
+            -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          rm "$RUNNER_TEMP/certificate.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          identity=$(security find-identity -v -p codesigning "$keychain" |
+                       awk '/Developer ID Application/ { print $2; exit }')
+          [ -n "$identity" ] || { echo "::error::No Developer ID Application identity in MACOS_CERTIFICATE"; exit 1; }
+          echo "MACOS_SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
+          xcrun notarytool store-credentials notary --keychain "$keychain" \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD"
+
       - name: Build the bundle
         run: make app
+
+      - name: Notarise the bundle
+        if: env.SIGNED_RELEASE == 'true'
+        run: make notarize
 
       - name: Run the bundle on the account pictures
         run: |
@@ -100,33 +142,42 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: Image Describer (ad hoc signed)
+          name: Image Describer (${{ env.SIGNED_RELEASE == 'true' && 'notarised' || 'ad hoc signed' }})
           path: build/Image Describer.zip
 
-  # On a release: the bundle the build job tested, as a disk image on it.
+      - name: Make the disk image
+        if: github.event_name == 'release'
+        run: |
+          make dmg DMG="build/Image-Describer-${GITHUB_REF_NAME}.dmg"
+          hdiutil verify "build/Image-Describer-${GITHUB_REF_NAME}.dmg"
+
+      - name: Notarise the disk image
+        if: env.SIGNED_RELEASE == 'true'
+        run: make notarize-dmg DMG="build/Image-Describer-${GITHUB_REF_NAME}.dmg"
+
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'release'
+        with:
+          name: disk image
+          path: build/Image-Describer-${{ github.ref_name }}.dmg
+
+  # On a release: the disk image of the bundle the build job tested, on it.
+  # A job of its own, so that only this one may write to the repository.
   release:
     needs: build
     if: github.event_name == 'release'
-    runs-on: macos-latest
-    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v5
-
       - uses: actions/download-artifact@v4
         with:
-          name: Image Describer (ad hoc signed)
-          path: build
-
-      - name: Make the disk image
-        run: |
-          cd build && ditto -x -k "Image Describer.zip" . && cd ..
-          codesign --verify --deep "build/Image Describer.app"
-          make dmg DMG="build/Image-Describer-${GITHUB_REF_NAME}.dmg"
-          hdiutil verify "build/Image-Describer-${GITHUB_REF_NAME}.dmg"
+          name: disk image
 
       - name: Put it on the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$GITHUB_REF_NAME" "build/Image-Describer-${GITHUB_REF_NAME}.dmg" --clobber
+        run: |
+          gh release upload "$GITHUB_REF_NAME" "Image-Describer-${GITHUB_REF_NAME}.dmg" \
+            --clobber --repo "$GITHUB_REPOSITORY"
